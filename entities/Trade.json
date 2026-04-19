@@ -1,0 +1,72 @@
+{
+  "type": "object",
+  "properties": {
+    "telegram_id": {
+      "type": "string"
+    },
+    "strategy_id": {
+      "type": "string"
+    },
+    "strategy_name": {
+      "type": "string"
+    },
+    "pair": {
+      "type": "string"
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "BUY",
+        "SELL"
+      ]
+    },
+    "entry_price": {
+      "type": "number"
+    },
+    "exit_price": {
+      "type": "number"
+    },
+    "take_profit": {
+      "type": "number"
+    },
+    "stop_loss": {
+      "type": "number"
+    },
+    "quantity": {
+      "type": "number"
+    },
+    "pnl": {
+      "type": "number"
+    },
+    "pnl_pct": {
+      "type": "number"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "open",
+        "closed_tp",
+        "closed_sl",
+        "closed_manual"
+      ]
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "paper",
+        "live"
+      ]
+    },
+    "exchange_order_id": {
+      "type": "string"
+    },
+    "signal_payload": {
+      "type": "object"
+    },
+    "close_reason": {
+      "type": "string"
+    }
+  },
+  "required": [],
+  "name": "Trade"
+}

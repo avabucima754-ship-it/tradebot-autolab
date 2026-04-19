@@ -1,0 +1,48 @@
+{
+  "type": "object",
+  "properties": {
+    "telegram_id": {
+      "type": "string"
+    },
+    "telegram_username": {
+      "type": "string"
+    },
+    "first_name": {
+      "type": "string"
+    },
+    "auto_trade_enabled": {
+      "type": "boolean"
+    },
+    "bot_stopped": {
+      "type": "boolean"
+    },
+    "binance_api_key_enc": {
+      "type": "string"
+    },
+    "binance_secret_enc": {
+      "type": "string"
+    },
+    "bybit_api_key_enc": {
+      "type": "string"
+    },
+    "bybit_secret_enc": {
+      "type": "string"
+    },
+    "exchange": {
+      "type": "string",
+      "enum": [
+        "binance",
+        "bybit",
+        "none"
+      ]
+    },
+    "onboarding_step": {
+      "type": "string"
+    },
+    "onboarding_data": {
+      "type": "object"
+    }
+  },
+  "required": [],
+  "name": "BotUser"
+}

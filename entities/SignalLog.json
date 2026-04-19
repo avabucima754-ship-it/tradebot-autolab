@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "properties": {
+    "telegram_id": {
+      "type": "string"
+    },
+    "pair": {
+      "type": "string"
+    },
+    "action": {
+      "type": "string"
+    },
+    "raw_payload": {
+      "type": "object"
+    },
+    "matched_strategy_id": {
+      "type": "string"
+    },
+    "processed": {
+      "type": "boolean"
+    },
+    "result": {
+      "type": "string"
+    }
+  },
+  "required": [],
+  "name": "SignalLog"
+}

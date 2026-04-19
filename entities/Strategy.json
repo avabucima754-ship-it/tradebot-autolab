@@ -1,0 +1,53 @@
+{
+  "type": "object",
+  "properties": {
+    "telegram_id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "market": {
+      "type": "string"
+    },
+    "pair": {
+      "type": "string"
+    },
+    "entry_type": {
+      "type": "string"
+    },
+    "entry_rules": {
+      "type": "object"
+    },
+    "take_profit_pct": {
+      "type": "number"
+    },
+    "stop_loss_pct": {
+      "type": "number"
+    },
+    "trailing_stop": {
+      "type": "boolean"
+    },
+    "risk_per_trade_pct": {
+      "type": "number"
+    },
+    "max_trades_per_day": {
+      "type": "number"
+    },
+    "max_loss_limit_pct": {
+      "type": "number"
+    },
+    "is_active": {
+      "type": "boolean"
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "paper",
+        "live"
+      ]
+    }
+  },
+  "required": [],
+  "name": "Strategy"
+}
