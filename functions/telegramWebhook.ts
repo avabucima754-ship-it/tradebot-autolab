@@ -1,4 +1,4 @@
-import { createClientFromRequest } from 'npm:@base44/sdk@0.8.25';
+import { createClient } from "npm:@base44/sdk@0.8.25";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -627,7 +627,7 @@ Deno.serve(async (req) => {
     const token = Deno.env.get('TELEGRAM_BOT_TOKEN');
     if (!token) return Response.json({ error: 'Bot token not configured' }, { status: 500 });
 
-    const db = createClientFromRequest(req, { serviceRole: true });
+    const db = createClient({ appId: Deno.env.get("BASE44_APP_ID") || "69e564a4bc835d35ecafe8e4", serviceRole: true });
 
     const body = await req.json().catch(() => ({}));
 
