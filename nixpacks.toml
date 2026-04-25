@@ -1,10 +1,11 @@
 [phases.setup]
-nixPkgs = ["nodejs-18_x"]
+nixPkgs = ["nodejs_20"]
+
+[phases.install]
+cmds = ["npm install --production=false"]
 
 [start]
 cmd = "node server.js"
 
-# cache-bust: 1777114969
-# single-file-deploy: true
-# db-inlined: true
-# no-db-js: true
+# cache-bust: 1777126262
+# forced-rebuild: true
