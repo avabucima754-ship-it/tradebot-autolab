@@ -1,6 +1,6 @@
 {
-  "name": "tradebot-autolab",
-  "version": "4.0.1",
+  "name": "tradebot-server",
+  "version": "4.1.1777124955",
   "description": "TradeBot AutoLab v4.0.1 - db fix 1777113986",
   "main": "server.js",
   "scripts": {
