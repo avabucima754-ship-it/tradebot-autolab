@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: tradebot-autolab
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ENCRYPT_KEY
+        sync: false
