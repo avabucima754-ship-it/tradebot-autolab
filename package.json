@@ -1,7 +1,7 @@
 {
   "name": "tradebot-autolab",
-  "version": "3.0.0",
-  "description": "TradeBot AutoLab - Professional Automated Trading Bot - rebuilt 1777112414",
+  "version": "4.0.1",
+  "description": "TradeBot AutoLab v4.0.1 - db fix 1777113986",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
