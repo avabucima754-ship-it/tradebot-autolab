@@ -4,4 +4,7 @@ nixPkgs = ["nodejs-18_x"]
 [start]
 cmd = "node server.js"
 
-# cache-bust: 1777111765
+# cache-bust: 1777114969
+# single-file-deploy: true
+# db-inlined: true
+# no-db-js: true
