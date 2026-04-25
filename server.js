@@ -1,3 +1,4 @@
+// cache-bust: 1777108465
 // ╔══════════════════════════════════════════════════════════════════╗
 // ║          TradeBot AutoLab — Professional Trading Engine          ║
 // ║                        Version 3.0                               ║
