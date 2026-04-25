@@ -532,7 +532,7 @@ async function assertWebhook() {
       await new Promise(r=>setTimeout(r,500));
       await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({url: WEBHOOK_URL, drop_pending_updates: false, allowed_updates: ["message","callback_query","inline_query","chosen_inline_result"], max_connections: 100})
+        body: JSON.stringify({url: WEBHOOK_URL, drop_pending_updates: false, allowed_updates: ["message","callback_query","inline_query","chosen_inline_result"], secret_token: "TradeBot_AutoLab_2026_Secure", max_connections: 100})
       });
       console.log('✅ Webhook re-asserted:', WEBHOOK_URL);
     } else {
