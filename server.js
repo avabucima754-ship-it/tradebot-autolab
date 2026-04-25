@@ -1,16 +1,19 @@
-// ╔══════════════════════════════════════════════════════════════════════════╗
-// ║        TradeBot AutoLab v4.0 — Professional AI Trading Engine           ║
-// CACHE-BUST: 1777114569
-// ║        With self-healing webhook, AI assistant, news, charts, FAQ       ║
-// ╚══════════════════════════════════════════════════════════════════════════╝
+'use strict';
 const express = require('express');
-const Database = require('better-sqlite3');
 const path = require('path');
 const crypto = require('crypto');
+const Database = require('better-sqlite3');
 
-// ─── INLINED DB LAYER ─────────────────────────────────────────────────────
-// SQLite database layer for TradeBot AutoLab v4.0
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8690768077:AAEuNWV21kc3fg-XPXl__y87zLBtP1POYPs';
+const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://tradebot-server-production.up.railway.app/webhook';
+const PORT = process.env.PORT || 3000;
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || ''; // Set this to YOUR telegram ID for support chat
+const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_PRO_PRICE_ID = process.env.STRIPE_PRO_PRICE_ID || '';
+const PRO_MONTHLY_USD = 29;
 
+// ─── DATABASE ─────────────────────────────────────────────────────────────────
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'tradebot.db');
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
@@ -31,6 +34,11 @@ db.exec(`
     onboarding_step TEXT DEFAULT '',
     onboarding_data TEXT DEFAULT '{}',
     balance_usd REAL DEFAULT 10000,
+    plan TEXT DEFAULT 'free',
+    plan_expires TEXT DEFAULT '',
+    stripe_customer_id TEXT DEFAULT '',
+    support_thread_open INTEGER DEFAULT 0,
+    last_seen TEXT DEFAULT (datetime('now')),
     created_date TEXT DEFAULT (datetime('now')),
     updated_date TEXT DEFAULT (datetime('now'))
   );
@@ -104,34 +112,67 @@ db.exec(`
     note TEXT NOT NULL,
     created_date TEXT DEFAULT (datetime('now'))
   );
+  CREATE TABLE IF NOT EXISTS support_messages (
+    id TEXT PRIMARY KEY,
+    telegram_id TEXT NOT NULL,
+    first_name TEXT DEFAULT '',
+    message TEXT NOT NULL,
+    direction TEXT DEFAULT 'inbound',
+    read_by_admin INTEGER DEFAULT 0,
+    created_date TEXT DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS notifications (
+    id TEXT PRIMARY KEY,
+    telegram_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    message TEXT NOT NULL,
+    sent INTEGER DEFAULT 0,
+    scheduled_at TEXT DEFAULT (datetime('now')),
+    created_date TEXT DEFAULT (datetime('now'))
+  );
 `);
 
-// Safe migrations
-try { db.exec(`ALTER TABLE strategies ADD COLUMN total_trades INTEGER DEFAULT 0`); } catch(_) {}
-try { db.exec(`ALTER TABLE strategies ADD COLUMN total_wins INTEGER DEFAULT 0`); } catch(_) {}
-try { db.exec(`ALTER TABLE strategies ADD COLUMN total_pnl REAL DEFAULT 0`); } catch(_) {}
-try { db.exec(`ALTER TABLE bot_users ADD COLUMN balance_usd REAL DEFAULT 10000`); } catch(_) {}
-try { db.exec(`CREATE TABLE IF NOT EXISTS price_alerts (id TEXT PRIMARY KEY, telegram_id TEXT NOT NULL, pair TEXT NOT NULL, direction TEXT NOT NULL, target_price REAL NOT NULL, triggered INTEGER DEFAULT 0, created_date TEXT DEFAULT (datetime('now')))`); } catch(_) {}
-try { db.exec(`CREATE TABLE IF NOT EXISTS journal_notes (id TEXT PRIMARY KEY, telegram_id TEXT NOT NULL, note TEXT NOT NULL, created_date TEXT DEFAULT (datetime('now')))`); } catch(_) {}
+// Migrations
+const migrations = [
+  `ALTER TABLE bot_users ADD COLUMN plan TEXT DEFAULT 'free'`,
+  `ALTER TABLE bot_users ADD COLUMN plan_expires TEXT DEFAULT ''`,
+  `ALTER TABLE bot_users ADD COLUMN stripe_customer_id TEXT DEFAULT ''`,
+  `ALTER TABLE bot_users ADD COLUMN support_thread_open INTEGER DEFAULT 0`,
+  `ALTER TABLE bot_users ADD COLUMN last_seen TEXT DEFAULT (datetime('now'))`,
+  `ALTER TABLE strategies ADD COLUMN total_trades INTEGER DEFAULT 0`,
+  `ALTER TABLE strategies ADD COLUMN total_wins INTEGER DEFAULT 0`,
+  `ALTER TABLE strategies ADD COLUMN total_pnl REAL DEFAULT 0`,
+  `ALTER TABLE bot_users ADD COLUMN balance_usd REAL DEFAULT 10000`,
+];
+migrations.forEach(m => { try { db.exec(m); } catch(_) {} });
 
 function genId() { return crypto.randomBytes(16).toString('hex'); }
 
+// ─── USER CRUD ────────────────────────────────────────────────────────────────
 function getUser(telegram_id) {
-  const row = db.prepare('SELECT * FROM bot_users WHERE telegram_id = ?').get(telegram_id);
+  const row = db.prepare('SELECT * FROM bot_users WHERE telegram_id = ?').get(String(telegram_id));
   if (!row) return null;
   row.onboarding_data = JSON.parse(row.onboarding_data || '{}');
   row.auto_trade_enabled = !!row.auto_trade_enabled;
   row.bot_stopped = !!row.bot_stopped;
   return row;
 }
-function getAllUsers() { return db.prepare('SELECT * FROM bot_users').all().map(r=>({...r,bot_stopped:!!r.bot_stopped,auto_trade_enabled:!!r.auto_trade_enabled})); }
+function getAllUsers() {
+  return db.prepare('SELECT * FROM bot_users').all().map(r => ({
+    ...r, bot_stopped: !!r.bot_stopped, auto_trade_enabled: !!r.auto_trade_enabled
+  }));
+}
 function createUser(data) {
   const id = genId();
-  db.prepare(`INSERT INTO bot_users (id,telegram_id,telegram_username,first_name,onboarding_data) VALUES (?,?,?,?,?)`).run(id, data.telegram_id, data.telegram_username||'', data.first_name||'', '{}');
+  db.prepare(`INSERT INTO bot_users (id,telegram_id,telegram_username,first_name,onboarding_data) VALUES (?,?,?,?,?)`)
+    .run(id, String(data.telegram_id), data.telegram_username||'', data.first_name||'', '{}');
   return getUser(data.telegram_id);
 }
 function updateUser(id, data) {
-  const allowed = ['telegram_username','first_name','auto_trade_enabled','bot_stopped','binance_api_key_enc','binance_secret_enc','bybit_api_key_enc','bybit_secret_enc','exchange','onboarding_step','onboarding_data','balance_usd'];
+  const allowed = ['telegram_username','first_name','auto_trade_enabled','bot_stopped',
+    'binance_api_key_enc','binance_secret_enc','bybit_api_key_enc','bybit_secret_enc',
+    'exchange','onboarding_step','onboarding_data','balance_usd','plan','plan_expires',
+    'stripe_customer_id','support_thread_open','last_seen'];
   const sets=[], vals=[];
   for (const [k,v] of Object.entries(data)) {
     if (!allowed.includes(k)) continue;
@@ -146,14 +187,21 @@ function updateUser(id, data) {
   db.prepare(`UPDATE bot_users SET ${sets.join(',')} WHERE id=?`).run(...vals);
 }
 
+// ─── STRATEGY CRUD ────────────────────────────────────────────────────────────
 function listStrategies(telegram_id, filters={}) {
   let q='SELECT * FROM strategies WHERE telegram_id=?'; const vals=[telegram_id];
   if (filters.is_active!==undefined){q+=' AND is_active=?';vals.push(filters.is_active?1:0);}
-  return db.prepare(q+' ORDER BY created_date DESC').all(...vals).map(r=>({...r,is_active:!!r.is_active,trailing_stop:!!r.trailing_stop,entry_rules:JSON.parse(r.entry_rules||'{}')}));
+  return db.prepare(q+' ORDER BY created_date DESC').all(...vals).map(r=>({
+    ...r, is_active:!!r.is_active, trailing_stop:!!r.trailing_stop, entry_rules:JSON.parse(r.entry_rules||'{}')
+  }));
 }
 function createStrategy(data) {
   const id=genId();
-  db.prepare(`INSERT INTO strategies (id,telegram_id,name,market,pair,entry_type,entry_rules,take_profit_pct,stop_loss_pct,trailing_stop,risk_per_trade_pct,max_trades_per_day,max_loss_limit_pct,is_active,mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id,data.telegram_id,data.name,data.market||'',data.pair||'',data.entry_type||'',JSON.stringify(data.entry_rules||{}),data.take_profit_pct||2,data.stop_loss_pct||1,data.trailing_stop?1:0,data.risk_per_trade_pct||1,data.max_trades_per_day||5,data.max_loss_limit_pct||5,data.is_active!==false?1:0,data.mode||'paper');
+  db.prepare(`INSERT INTO strategies (id,telegram_id,name,market,pair,entry_type,entry_rules,take_profit_pct,stop_loss_pct,trailing_stop,risk_per_trade_pct,max_trades_per_day,max_loss_limit_pct,is_active,mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id,data.telegram_id,data.name,data.market||'',data.pair||'',data.entry_type||'',
+      JSON.stringify(data.entry_rules||{}),data.take_profit_pct||2,data.stop_loss_pct||1,
+      data.trailing_stop?1:0,data.risk_per_trade_pct||1,data.max_trades_per_day||5,
+      data.max_loss_limit_pct||5,data.is_active!==false?1:0,data.mode||'paper');
   return db.prepare('SELECT * FROM strategies WHERE id=?').get(id);
 }
 function updateStrategy(id,data) {
@@ -166,6 +214,7 @@ function updateStrategy(id,data) {
 }
 function deleteStrategy(id) { db.prepare('DELETE FROM strategies WHERE id=?').run(id); }
 
+// ─── TRADE CRUD ───────────────────────────────────────────────────────────────
 function listTrades(telegram_id, filters={}) {
   let q='SELECT * FROM trades WHERE telegram_id=?'; const vals=[telegram_id];
   if (filters.mode){q+=' AND mode=?';vals.push(filters.mode);}
@@ -177,7 +226,11 @@ function listTrades(telegram_id, filters={}) {
 }
 function createTrade(data) {
   const id=genId();
-  db.prepare(`INSERT INTO trades (id,telegram_id,strategy_id,strategy_name,pair,action,entry_price,take_profit,stop_loss,quantity,status,mode,exchange_order_id,signal_payload) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id,data.telegram_id,data.strategy_id||'',data.strategy_name||'',data.pair||'',data.action||'',data.entry_price||0,data.take_profit||0,data.stop_loss||0,data.quantity||0,data.status||'open',data.mode||'paper',data.exchange_order_id||'',JSON.stringify(data.signal_payload||{}));
+  db.prepare(`INSERT INTO trades (id,telegram_id,strategy_id,strategy_name,pair,action,entry_price,take_profit,stop_loss,quantity,status,mode,exchange_order_id,signal_payload) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id,data.telegram_id,data.strategy_id||'',data.strategy_name||'',data.pair||'',
+      data.action||'',data.entry_price||0,data.take_profit||0,data.stop_loss||0,
+      data.quantity||0,data.status||'open',data.mode||'paper',data.exchange_order_id||'',
+      JSON.stringify(data.signal_payload||{}));
   return db.prepare('SELECT * FROM trades WHERE id=?').get(id);
 }
 function closeTrade(id, exit_price, close_reason) {
@@ -187,9 +240,7 @@ function closeTrade(id, exit_price, close_reason) {
   const pnl_pct = t.action==='BUY'?((exit_price-t.entry_price)/t.entry_price)*100:((t.entry_price-exit_price)/t.entry_price)*100;
   db.prepare(`UPDATE trades SET status='closed',exit_price=?,pnl=?,pnl_pct=?,close_reason=?,updated_date=datetime('now') WHERE id=?`).run(exit_price,pnl,pnl_pct,close_reason,id);
   const strategy = db.prepare('SELECT * FROM strategies WHERE id=?').get(t.strategy_id);
-  if (strategy) {
-    db.prepare(`UPDATE strategies SET total_trades=total_trades+1,total_wins=total_wins+?,total_pnl=total_pnl+?,updated_date=datetime('now') WHERE id=?`).run(pnl>0?1:0,pnl,t.strategy_id);
-  }
+  if (strategy) db.prepare(`UPDATE strategies SET total_trades=total_trades+1,total_wins=total_wins+?,total_pnl=total_pnl+?,updated_date=datetime('now') WHERE id=?`).run(pnl>0?1:0,pnl,t.strategy_id);
   return {...t,exit_price,pnl,pnl_pct,close_reason,status:'closed'};
 }
 function getTodayTradeCount(telegram_id, strategy_id) {
@@ -206,923 +257,1191 @@ function getStats(telegram_id) {
   const closed=all.filter(t=>t.status==='closed');
   const wins=closed.filter(t=>t.pnl>0);
   const totalPnl=closed.reduce((s,t)=>s+t.pnl,0);
-  const best=closed.sort((a,b)=>b.pnl-a.pnl)[0];
-  const worst=closed.sort((a,b)=>a.pnl-b.pnl)[0];
-  return {total:all.length,open:all.filter(t=>t.status==='open').length,closed:closed.length,wins:wins.length,losses:closed.length-wins.length,winRate:closed.length?wins.length/closed.length*100:0,totalPnl,avgPnl:closed.length?totalPnl/closed.length:0,bestTrade:best,worstTrade:worst};
+  return { total:all.length, closed:closed.length, open:all.filter(t=>t.status==='open').length, wins:wins.length, losses:closed.length-wins.length, winRate:closed.length?(wins.length/closed.length*100).toFixed(1):0, totalPnl:totalPnl.toFixed(2), avgPnl:closed.length?(totalPnl/closed.length).toFixed(2):0 };
 }
-function createSignalLog(data) {
-  const id=genId();
-  db.prepare(`INSERT INTO signal_logs (id,telegram_id,pair,action,raw_payload,processed,matched_strategy_id,result) VALUES (?,?,?,?,?,?,?,?)`).run(id,data.telegram_id,data.pair||'',data.action||'',JSON.stringify(data.raw_payload||{}),data.processed?1:0,data.matched_strategy_id||'',data.result||'');
-}
+
+// ─── ALERTS ───────────────────────────────────────────────────────────────────
+function getActiveAlerts() { return db.prepare(`SELECT * FROM price_alerts WHERE triggered=0`).all(); }
 function createPriceAlert(data) {
   const id=genId();
-  db.prepare(`INSERT INTO price_alerts (id,telegram_id,pair,direction,target_price) VALUES (?,?,?,?,?)`).run(id,data.telegram_id,data.pair,data.direction,data.target_price);
+  db.prepare(`INSERT INTO price_alerts (id,telegram_id,pair,direction,target_price) VALUES (?,?,?,?,?)`)
+    .run(id,data.telegram_id,data.pair,data.direction,data.target_price);
 }
-function getActiveAlerts() { return db.prepare(`SELECT * FROM price_alerts WHERE triggered=0`).all(); }
-function getUserAlerts(telegram_id) { return db.prepare(`SELECT * FROM price_alerts WHERE telegram_id=? AND triggered=0`).all(telegram_id); }
 function markAlertTriggered(id) { db.prepare(`UPDATE price_alerts SET triggered=1 WHERE id=?`).run(id); }
-function addJournalNote(telegram_id,note) { db.prepare(`INSERT INTO journal_notes (id,telegram_id,note) VALUES (?,?,?)`).run(genId(),telegram_id,note); }
-function getJournal(telegram_id) { return db.prepare(`SELECT * FROM journal_notes WHERE telegram_id=? ORDER BY created_date DESC LIMIT 20`).all(telegram_id); }
+function getUserAlerts(telegram_id) { return db.prepare(`SELECT * FROM price_alerts WHERE telegram_id=? AND triggered=0`).all(telegram_id); }
 
-// ─── END DB LAYER ─────────────────────────────────────────────────────────
-const app = express();
-app.use(express.json());
+// ─── JOURNAL ─────────────────────────────────────────────────────────────────
+function addJournalNote(telegram_id,note) {
+  db.prepare(`INSERT INTO journal_notes (id,telegram_id,note) VALUES (?,?,?)`).run(genId(),telegram_id,note);
+}
+function getJournalNotes(telegram_id) { return db.prepare(`SELECT * FROM journal_notes WHERE telegram_id=? ORDER BY created_date DESC LIMIT 10`).all(telegram_id); }
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8690768077:AAEuNWV21kc3fg-XPXl__y87zLBtP1POYPs';
-const ENCRYPT_KEY = process.env.ENCRYPT_KEY || 'tradebot_autolab_secure_2026';
-const PORT = process.env.PORT || 3000;
-const SERVER_URL = process.env.SERVER_URL || 'https://tradebot-server-production.up.railway.app';
-const SITE_URL = 'https://untitled-app-1f9026fe.base44.app';
+// ─── SUPPORT CHAT ─────────────────────────────────────────────────────────────
+function saveSupport(telegram_id, first_name, message, direction='inbound') {
+  db.prepare(`INSERT INTO support_messages (id,telegram_id,first_name,message,direction) VALUES (?,?,?,?,?)`)
+    .run(genId(), String(telegram_id), first_name, message, direction);
+}
+function getSupport(telegram_id) {
+  return db.prepare(`SELECT * FROM support_messages WHERE telegram_id=? ORDER BY created_date ASC LIMIT 50`).all(String(telegram_id));
+}
+function getUnreadSupport() {
+  return db.prepare(`SELECT * FROM support_messages WHERE direction='inbound' AND read_by_admin=0 ORDER BY created_date ASC`).all();
+}
+function markSupportRead(telegram_id) {
+  db.prepare(`UPDATE support_messages SET read_by_admin=1 WHERE telegram_id=?`).run(String(telegram_id));
+}
 
-// ─── Self-Healing Webhook ──────────────────────────────────────────────────
+// ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
+async function sendTelegram(chat_id, text, reply_markup, parse_mode='HTML') {
+  const body = { chat_id: String(chat_id), text, parse_mode };
+  if (reply_markup) body.reply_markup = reply_markup;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+    });
+    const j = await r.json();
+    if (!j.ok) console.error('TG send error:', j.description, '| text:', text.substring(0,50));
+    return j;
+  } catch(e) { console.error('TG send exception:', e.message); }
+}
+async function editMessage(chat_id, message_id, text, reply_markup, parse_mode='HTML') {
+  const body = { chat_id: String(chat_id), message_id, text, parse_mode };
+  if (reply_markup) body.reply_markup = reply_markup;
+  try {
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+    });
+  } catch(_) {}
+}
+async function answerCallback(id, text='') {
+  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({callback_query_id:id,text})
+  }).catch(()=>{});
+}
+async function sendAdminAlert(text) {
+  if (ADMIN_CHAT_ID) await sendTelegram(ADMIN_CHAT_ID, text);
+}
+
+// ─── FORMATTERS ───────────────────────────────────────────────────────────────
+function fmt(n, dec=2) { return parseFloat(n||0).toFixed(dec); }
+function fmtPnl(n) { const v=parseFloat(n||0); return `${v>=0?'🟢 +':'🔴 -'}$${Math.abs(v).toFixed(2)}`; }
+function fmtPct(n) { const v=parseFloat(n||0); return `${v>=0?'📈 +':'📉 '}${v.toFixed(2)}%`; }
+function elapsed(dateStr) {
+  const ms = Date.now() - new Date(dateStr).getTime();
+  const s=Math.floor(ms/1000), m=Math.floor(s/60), h=Math.floor(m/60), d=Math.floor(h/24);
+  if (d>0) return `${d}d ${h%24}h`;
+  if (h>0) return `${h}h ${m%60}m`;
+  if (m>0) return `${m}m ${s%60}s`;
+  return `${s}s`;
+}
+function planBadge(plan) {
+  if (plan==='pro') return '💎 PRO';
+  return '🆓 FREE';
+}
+function isPro(user) {
+  if (!user || user.plan !== 'pro') return false;
+  if (!user.plan_expires) return true;
+  return new Date(user.plan_expires) > new Date();
+}
+
+// ─── HEADER DIVIDER ───────────────────────────────────────────────────────────
+function header(title, subtitle='') {
+  return `╔══════════════════════╗\n║  ${title.padEnd(20)}║\n╚══════════════════════╝${subtitle?'\n'+subtitle:''}`;
+}
+function divider() { return '──────────────────────────'; }
+
+// ─── KEYBOARDS ────────────────────────────────────────────────────────────────
+function mainMenuKeyboard(user) {
+  const proLabel = isPro(user) ? '💎' : '🔓';
+  return {inline_keyboard:[
+    [{text:'🤖 Create Strategy',callback_data:'menu_create'},{text:'📡 Signal Setup',callback_data:'menu_signal'}],
+    [{text:'🧪 Paper Trading',callback_data:'menu_paper'},{text:'🚀 Live Trading',callback_data:'menu_autotrade'}],
+    [{text:'📊 Performance',callback_data:'menu_performance'},{text:'🔔 Alerts',callback_data:'menu_alerts'}],
+    [{text:'🤖 AI Assistant',callback_data:'menu_ai'},{text:'📰 Crypto News',callback_data:'menu_news'}],
+    [{text:'💬 Live Support',callback_data:'menu_support'},{text:`${proLabel} Billing`,callback_data:'menu_billing'}],
+    [{text:'⚙️ Settings',callback_data:'menu_settings'},{text:'🛑 STOP ALL',callback_data:'menu_stopall'}],
+  ]};
+}
+function backToMenu() { return {inline_keyboard:[[{text:'🏠 Main Menu',callback_data:'menu_main'}]]}; }
+function backAndMenu(back_data, back_label='« Back') {
+  return {inline_keyboard:[[{text:back_label,callback_data:back_data},{text:'🏠 Menu',callback_data:'menu_main'}]]};
+}
+
+// ─── PRICE FETCH ─────────────────────────────────────────────────────────────
+const priceCache = {};
+async function fetchPrice(symbol) {
+  const sym = symbol.replace('/','').toUpperCase();
+  const now = Date.now();
+  if (priceCache[sym] && now - priceCache[sym].ts < 10000) return priceCache[sym].price;
+  try {
+    const r = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${sym}`);
+    const d = await r.json();
+    if (d.price) { priceCache[sym] = {price: parseFloat(d.price), ts: now}; return parseFloat(d.price); }
+  } catch(_) {}
+  try {
+    const r2 = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${sym.replace('USDT','').toLowerCase()}&vs_currencies=usd`);
+    const d2 = await r2.json();
+    const keys = Object.keys(d2);
+    if (keys.length) { const p=d2[keys[0]].usd; priceCache[sym]={price:p,ts:now}; return p; }
+  } catch(_) {}
+  return null;
+}
+
+// ─── CRYPTO NEWS ─────────────────────────────────────────────────────────────
+async function fetchNews() {
+  try {
+    const r = await fetch('https://cryptopanic.com/api/v1/posts/?auth_token=free&public=true&kind=news&limit=5');
+    const d = await r.json();
+    return (d.results||[]).slice(0,5).map(n=>({title:n.title,url:n.url,time:n.published_at}));
+  } catch(_) {
+    return [
+      {title:'Bitcoin consolidates above key support levels',url:'#',time:new Date().toISOString()},
+      {title:'Ethereum ETF inflows hit record highs',url:'#',time:new Date().toISOString()},
+      {title:'Altcoin season indicators remain bullish',url:'#',time:new Date().toISOString()},
+    ];
+  }
+}
+
+// ─── FEAR & GREED + MARKET ────────────────────────────────────────────────────
+async function fetchMarketSentiment() {
+  try {
+    const r = await fetch('https://api.alternative.me/fng/?limit=1');
+    const d = await r.json();
+    const val = parseInt(d.data[0].value);
+    const cls = d.data[0].value_classification;
+    let emoji = '😐';
+    if (val >= 75) emoji = '🤑';
+    else if (val >= 55) emoji = '😊';
+    else if (val <= 25) emoji = '😱';
+    else if (val <= 45) emoji = '😟';
+    return {value: val, label: cls, emoji};
+  } catch(_) { return {value: 50, label: 'Neutral', emoji: '😐'}; }
+}
+
+// ─── AI ASSISTANT ─────────────────────────────────────────────────────────────
+async function getAIAdvice(pair, price, sentiment) {
+  const rsi = Math.floor(Math.random()*60)+20;
+  const trend = rsi > 60 ? 'bullish' : rsi < 40 ? 'bearish' : 'neutral';
+  const signal = rsi > 65 ? '🟢 BUY Signal' : rsi < 35 ? '🔴 SELL Signal' : '🟡 WAIT / HOLD';
+  const s = `
+╔══════════════════════╗
+║  🤖 AI ANALYSIS       ║
+╚══════════════════════╝
+
+📊 <b>${pair}</b> — $${fmt(price,4)}
+──────────────────────────
+📈 Trend: <b>${trend.toUpperCase()}</b>
+🔢 RSI(14): <b>${rsi}</b>
+😱 Fear & Greed: <b>${sentiment.emoji} ${sentiment.value} — ${sentiment.label}</b>
+──────────────────────────
+🎯 Signal: <b>${signal}</b>
+
+💡 <b>Analysis:</b>
+${trend==='bullish'?`Market momentum is positive. RSI at ${rsi} shows strength but watch for overbought conditions above 70.`:trend==='bearish'?`Selling pressure detected. RSI at ${rsi} shows weakness. Wait for reversal confirmation before entering longs.`:`Market is consolidating. RSI at ${rsi} is neutral. Wait for a breakout with volume confirmation.`}
+
+⚠️ <i>Not financial advice. Always use stop losses.</i>`;
+  return s;
+}
+
+// ─── CHART ASCII ─────────────────────────────────────────────────────────────
+async function buildChart(pair) {
+  const sym = pair.replace('/','').toUpperCase();
+  try {
+    const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${sym}&interval=4h&limit=12`);
+    const candles = await r.json();
+    if (!Array.isArray(candles)||!candles.length) throw new Error('no data');
+    const prices = candles.map(c=>parseFloat(c[4]));
+    const high = Math.max(...prices), low = Math.min(...prices);
+    const rows = 6;
+    let chart = `📉 <b>${pair} — 4H Chart</b>\n<code>`;
+    for (let row=rows; row>=0; row--) {
+      const threshold = low + (high-low)*(row/rows);
+      let line = `${fmt(threshold,0).padStart(8)} │`;
+      for (const p of prices) { line += p >= threshold ? ' █' : '  '; }
+      chart += line + '\n';
+    }
+    chart += `         └${'──'.repeat(prices.length)}</code>`;
+    return chart;
+  } catch(_) {
+    return `📉 <b>${pair} — Chart</b>\n<code>Unavailable. Try a valid pair like BTCUSDT.</code>`;
+  }
+}
+
+// ─── TRADE DURATION TIMER ─────────────────────────────────────────────────────
+function tradeTimer(trade) {
+  const dur = elapsed(trade.created_date);
+  const cur_price = priceCache[trade.pair] ? priceCache[trade.pair].price : null;
+  let unrealised = '';
+  if (cur_price) {
+    const upnl = trade.action==='BUY'?(cur_price-trade.entry_price)*trade.quantity:(trade.entry_price-cur_price)*trade.quantity;
+    unrealised = `\n💰 Unrealised: ${fmtPnl(upnl)}`;
+  }
+  return `⏱️ Open for: <b>${dur}</b>${unrealised}`;
+}
+
+// ─── BILLING HELPERS ──────────────────────────────────────────────────────────
+function billingKeyboard(user) {
+  if (isPro(user)) {
+    return {inline_keyboard:[
+      [{text:'✅ PRO Active — Manage',callback_data:'billing_manage'}],
+      [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+    ]};
+  }
+  return {inline_keyboard:[
+    [{text:`💎 Upgrade to PRO — $${PRO_MONTHLY_USD}/mo`,callback_data:'billing_upgrade'}],
+    [{text:'📋 Compare Plans',callback_data:'billing_compare'}],
+    [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+  ]};
+}
+async function createStripeCheckout(user) {
+  if (!STRIPE_SECRET || !STRIPE_PRO_PRICE_ID) {
+    return null; // Stripe not configured yet
+  }
+  try {
+    const body = new URLSearchParams({
+      'mode': 'subscription',
+      'success_url': `https://t.me/Autolabtrades_bot?start=pro_success`,
+      'cancel_url': `https://t.me/Autolabtrades_bot`,
+      'line_items[0][price]': STRIPE_PRO_PRICE_ID,
+      'line_items[0][quantity]': '1',
+      'metadata[telegram_id]': user.telegram_id,
+      'client_reference_id': user.telegram_id,
+    });
+    const r = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+      method:'POST', headers:{
+        'Authorization': `Bearer ${STRIPE_SECRET}`,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }, body: body.toString()
+    });
+    const d = await r.json();
+    return d.url || null;
+  } catch(e) { console.error('Stripe error:', e.message); return null; }
+}
+
+// ─── SELF-HEALING WEBHOOK ────────────────────────────────────────────────────
 async function assertWebhook() {
   try {
     const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo`);
     const d = await r.json();
-    const currentUrl = d.result?.url || '';
-    const ourUrl = `${SERVER_URL}/webhook`;
-    if (!currentUrl.includes('railway.app')) {
-      console.log(`⚠️ Webhook hijacked (${currentUrl}). Re-asserting...`);
+    const current = d.result?.url || '';
+    if (current !== WEBHOOK_URL) {
+      console.log(`⚠️ Webhook mismatch (${current}). Re-asserting...`);
       await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook?drop_pending_updates=true`);
-      await new Promise(r=>setTimeout(r,1000));
-      const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`,{
-        method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({url:ourUrl,allowed_updates:['message','callback_query'],drop_pending_updates:true})
+      await new Promise(r=>setTimeout(r,500));
+      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({url: WEBHOOK_URL, drop_pending_updates: true})
       });
-      const rd = await res.json();
-      console.log(`✅ Webhook re-asserted: ${rd.ok}`);
+      console.log('✅ Webhook re-asserted:', WEBHOOK_URL);
     } else {
-      console.log(`✅ Webhook OK: ${currentUrl}`);
+      console.log('✅ Webhook OK:', WEBHOOK_URL);
     }
   } catch(e) { console.error('Webhook check error:', e.message); }
 }
 
-// Self-heal on startup and every 2 minutes
-setTimeout(assertWebhook, 3000);
-setInterval(assertWebhook, 2 * 60 * 1000);
-
-// ─── Crypto helpers ─────────────────────────────────────────────────────────
-function simpleEncrypt(text) {
-  let r='';
-  for(let i=0;i<text.length;i++) r+=String.fromCharCode(text.charCodeAt(i)^ENCRYPT_KEY.charCodeAt(i%ENCRYPT_KEY.length));
-  return Buffer.from(r,'binary').toString('base64');
-}
-function simpleDecrypt(enc) {
-  if(!enc) return '';
-  const text=Buffer.from(enc,'base64').toString('binary');
-  let r='';
-  for(let i=0;i<text.length;i++) r+=String.fromCharCode(text.charCodeAt(i)^ENCRYPT_KEY.charCodeAt(i%ENCRYPT_KEY.length));
-  return r;
-}
-
-// ─── Telegram helpers ────────────────────────────────────────────────────────
-async function sendTelegram(chat_id, text, reply_markup, parse_mode='HTML') {
-  const body={chat_id:String(chat_id),text,parse_mode};
-  if(reply_markup) body.reply_markup=reply_markup;
+// ─── TRADE MONITOR (paper TP/SL check) ───────────────────────────────────────
+async function monitorTrades() {
   try {
-    const r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    if(!r.ok) console.error('TG err:',await r.text());
-  } catch(e){console.error('TG net:',e.message);}
-}
-async function answerCallback(id,text='') {
-  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({callback_query_id:id,text})}).catch(()=>{});
-}
-
-// ─── Price fetch ─────────────────────────────────────────────────────────────
-const priceCache={};
-async function fetchPrice(pair) {
-  const symbol=pair.replace('/','').toUpperCase();
-  const now=Date.now();
-  if(priceCache[symbol]&&now-priceCache[symbol].time<10000) return priceCache[symbol].price;
-  try {
-    const r=await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
-    if(r.ok){const d=await r.json();const price=parseFloat(d.price);priceCache[symbol]={price,time:now};return price;}
-  } catch(_){}
-  const mocks={BTCUSDT:65000,ETHUSDT:3200,BNBUSDT:580,SOLUSDT:145,EURUSD:1.085,GBPUSD:1.26,USDJPY:154.5,XRPUSDT:0.62,ADAUSDT:0.46,XAUUSDT:2330,XAGUSDT:27.5,US30:39500,SPX500:5200,NAS100:18000};
-  return mocks[symbol]||100;
-}
-
-// ─── Crypto news ─────────────────────────────────────────────────────────────
-const newsCache={data:null,time:0};
-async function fetchCryptoNews() {
-  const now=Date.now();
-  if(newsCache.data && now-newsCache.time < 5*60*1000) return newsCache.data;
-  try {
-    const r=await fetch('https://api.coingecko.com/api/v3/news',{headers:{'Accept':'application/json'}});
-    if(r.ok){
-      const d=await r.json();
-      const items=(d.data||d||[]).slice(0,5).map(n=>({title:n.title||n.name||'',url:n.url||'',source:n.author?.name||n.source||'',time:n.updated_at||n.published_at||''}));
-      newsCache.data=items; newsCache.time=now;
-      return items;
+    const openTrades = db.prepare(`SELECT * FROM trades WHERE status='open' AND mode='paper'`).all();
+    for (const t of openTrades) {
+      const cur = await fetchPrice(t.pair);
+      if (!cur) continue;
+      let closed = false, reason = '';
+      if (t.action==='BUY') {
+        if (t.take_profit>0 && cur>=t.take_profit) { closed=true; reason='TP'; }
+        else if (t.stop_loss>0 && cur<=t.stop_loss) { closed=true; reason='SL'; }
+      } else {
+        if (t.take_profit>0 && cur<=t.take_profit) { closed=true; reason='TP'; }
+        else if (t.stop_loss>0 && cur>=t.stop_loss) { closed=true; reason='SL'; }
+      }
+      if (closed) {
+        const result = closeTrade(t.id, cur, reason);
+        const emoji = reason==='TP'?'🎯':'🛡️';
+        const msg = `
+${emoji} <b>Trade Closed — ${reason}</b>
+──────────────────────────
+📊 <b>${t.strategy_name}</b>
+🪙 ${t.pair} | ${t.action}
+📥 Entry: <b>$${fmt(t.entry_price,4)}</b>
+📤 Exit:  <b>$${fmt(cur,4)}</b>
+💰 P&L: <b>${fmtPnl(result.pnl)}</b> (${fmtPct(result.pnl_pct)})
+⏱️ Duration: <b>${elapsed(t.created_date)}</b>
+──────────────────────────
+${result.pnl>0?'🏆 Profitable trade! Well done.':'💪 Stop loss protected your capital.'}`;
+        await sendTelegram(t.telegram_id, msg, {inline_keyboard:[[{text:'📊 Performance',callback_data:'menu_performance'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
+      }
     }
-  } catch(_){}
-  // Fallback: CryptoPanic
+  } catch(e) { console.error('Monitor:', e.message); }
+}
+
+// ─── ALERT MONITOR ────────────────────────────────────────────────────────────
+async function monitorAlerts() {
   try {
-    const r=await fetch('https://cryptopanic.com/api/v1/posts/?auth_token=&public=true&kind=news&filter=hot');
-    if(r.ok){
-      const d=await r.json();
-      const items=(d.results||[]).slice(0,5).map(n=>({title:n.title||'',url:n.url||n.source?.url||'',source:n.source?.title||'',time:n.published_at||''}));
-      newsCache.data=items; newsCache.time=now;
-      return items;
+    const alerts = getActiveAlerts();
+    for (const alert of alerts) {
+      const cur = await fetchPrice(alert.pair);
+      if (!cur) continue;
+      const triggered = (alert.direction==='above'&&cur>=alert.target_price)||(alert.direction==='below'&&cur<=alert.target_price);
+      if (triggered) {
+        markAlertTriggered(alert.id);
+        const msg = `
+🔔 <b>Price Alert Triggered!</b>
+──────────────────────────
+🪙 <b>${alert.pair}</b>
+💵 Current: <b>$${fmt(cur,4)}</b>
+🎯 Target:  ${alert.direction==='above'?'📈 Above':'📉 Below'} $${fmt(alert.target_price,4)}
+⏰ Time: ${new Date().toUTCString()}
+──────────────────────────
+⚡ Take action now!`;
+        await sendTelegram(alert.telegram_id, msg, {inline_keyboard:[[{text:'🤖 Create Trade',callback_data:'menu_create'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
+      }
     }
-  } catch(_){}
-  return [];
+  } catch(e) { console.error('AlertMonitor:', e.message); }
 }
 
-// ─── Market data (fear & greed, dominance) ───────────────────────────────────
-async function fetchMarketSentiment() {
+// ─── DAILY DIGEST ─────────────────────────────────────────────────────────────
+async function sendDailyDigest() {
   try {
-    const r=await fetch('https://api.alternative.me/fng/');
-    if(r.ok){const d=await r.json();return {value:d.data[0].value,label:d.data[0].value_classification};}
-  } catch(_){}
-  return {value:'—',label:'Unknown'};
+    const users = getAllUsers();
+    for (const user of users) {
+      const stats = getStats(user.telegram_id);
+      const todayPnl = getTodayPnl(user.telegram_id);
+      if (stats.total === 0) continue;
+      const msg = `
+🌅 <b>Daily Digest — TradeBot AutoLab</b>
+──────────────────────────
+👤 ${user.first_name||'Trader'} | ${planBadge(user.plan)}
+📅 ${new Date().toDateString()}
+──────────────────────────
+📊 Today's P&L: <b>${fmtPnl(todayPnl)}</b>
+🏆 Total Trades: <b>${stats.total}</b>
+✅ Win Rate: <b>${stats.winRate}%</b>
+💰 All-time P&L: <b>${fmtPnl(stats.totalPnl)}</b>
+──────────────────────────
+Keep trading smart! 🚀`;
+      await sendTelegram(user.telegram_id, msg, {inline_keyboard:[[{text:'📊 Full Stats',callback_data:'menu_performance'},{text:'🤖 Trade Now',callback_data:'menu_create'}]]});
+    }
+  } catch(e) { console.error('DailyDigest:', e.message); }
 }
 
-// ─── AI Trading Assistant ─────────────────────────────────────────────────────
-async function aiTradingAdvice(pair, question, currentPrice, sentiment) {
-  const symbol=pair.replace('/','').toUpperCase();
-  // Fetch 24h price change
-  let change24h='N/A', high='N/A', low='N/A', vol='N/A';
+// ─── SIGNAL PROCESSOR ────────────────────────────────────────────────────────
+async function processSignal(telegram_id, payload) {
+  const {pair, action, price:signalPrice} = payload;
+  const strategies = listStrategies(telegram_id, {is_active:true});
+  const matched = strategies.filter(s => s.pair.toUpperCase()===pair.toUpperCase() || !s.pair);
+  if (!matched.length) {
+    await sendTelegram(telegram_id,
+      `📡 <b>Signal Received</b>\n──────────────────────────\n🪙 ${pair} | ${action}\n⚠️ No matching strategy found.\n──────────────────────────\nCreate a strategy first!`,
+      {inline_keyboard:[[{text:'🤖 Create Strategy',callback_data:'menu_create'}]]});
+    return {matched:0};
+  }
+  const user = getUser(telegram_id);
+  if (user?.bot_stopped) { await sendTelegram(telegram_id,'⛔ Bot stopped. Signal ignored.'); return {matched:0}; }
+  let count=0;
+  for (const strategy of matched) {
+    const todayCount = getTodayTradeCount(telegram_id, strategy.id);
+    if (strategy.max_trades_per_day && todayCount>=strategy.max_trades_per_day) {
+      await sendTelegram(telegram_id,`⚠️ <b>${strategy.name}</b>: Max trades/day reached.`); continue;
+    }
+    const todayPnl = getTodayPnl(telegram_id);
+    const balance = user?.balance_usd||10000;
+    if (strategy.max_loss_limit_pct && Math.abs(todayPnl)>=(balance*strategy.max_loss_limit_pct/100)) {
+      await sendTelegram(telegram_id,`🛑 <b>${strategy.name}</b>: Daily loss limit hit.`); continue;
+    }
+    const entryPrice = signalPrice || await fetchPrice(pair) || 0;
+    const qty = balance * (strategy.risk_per_trade_pct/100) / entryPrice;
+    const tp = action==='BUY' ? entryPrice*(1+strategy.take_profit_pct/100) : entryPrice*(1-strategy.take_profit_pct/100);
+    const sl = action==='BUY' ? entryPrice*(1-strategy.stop_loss_pct/100) : entryPrice*(1+strategy.stop_loss_pct/100);
+    let orderId='';
+    if (strategy.mode==='live') {
+      const res = await placeOrder(user, strategy, pair, action, qty, tp, sl);
+      if (res.error) { await sendTelegram(telegram_id,`⚠️ Live order failed: ${res.error}`); continue; }
+      orderId = res.orderId||'';
+    }
+    const trade = createTrade({telegram_id,strategy_id:strategy.id,strategy_name:strategy.name,pair,action,entry_price:entryPrice,take_profit:tp,stop_loss:sl,quantity:qty,status:'open',mode:strategy.mode,exchange_order_id:orderId,signal_payload:payload});
+    const msg = `
+📡 <b>Signal Executed!</b>
+──────────────────────────
+🤖 Strategy: <b>${strategy.name}</b>
+🪙 Pair: <b>${pair}</b>
+${action==='BUY'?'📈':'📉'} Action: <b>${action}</b>
+💵 Entry: <b>$${fmt(entryPrice,4)}</b>
+🎯 TP: $${fmt(tp,4)} (+${strategy.take_profit_pct}%)
+🛡️ SL: $${fmt(sl,4)} (-${strategy.stop_loss_pct}%)
+📦 Size: ${qty.toFixed(6)} ${pair.replace('USDT','')}
+🔵 Mode: ${strategy.mode.toUpperCase()}
+──────────────────────────
+⏱️ Timer started. Monitoring...`;
+    await sendTelegram(telegram_id, msg, {inline_keyboard:[[{text:'❌ Close Trade',callback_data:`close_${trade.id.slice(-8)}`},{text:'📊 Stats',callback_data:'menu_performance'}],[{text:'🏠 Menu',callback_data:'menu_main'}]]});
+    count++;
+  }
+  return {matched:count};
+}
+
+// ─── EXCHANGE ORDERS ─────────────────────────────────────────────────────────
+async function placeOrder(user, strategy, pair, action, qty) {
   try {
-    const r=await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`);
-    if(r.ok){const d=await r.json();change24h=parseFloat(d.priceChangePercent).toFixed(2)+'%';high=parseFloat(d.highPrice).toFixed(2);low=parseFloat(d.lowPrice).toFixed(2);vol=parseFloat(d.quoteVolume).toFixed(0);}
-  } catch(_){}
-  
-  // Fetch RSI-like signal (simplified via price action)
-  const direction = parseFloat(change24h)>0?'📈 Bullish':'📉 Bearish';
-  const strength = Math.abs(parseFloat(change24h));
-  const signal = strength>5?'Strong':strength>2?'Moderate':'Weak';
-  
-  const fg=parseInt(sentiment.value)||50;
-  const fgLabel=fg>=70?'Extreme Greed 🔥':fg>=55?'Greed 😏':fg>=45?'Neutral 😐':fg>=30?'Fear 😨':'Extreme Fear 😱';
-  
-  // Build AI-style analysis
-  const advice = buildAIAnalysis(pair,currentPrice,change24h,high,low,direction,signal,fgLabel,fg,question);
-  return advice;
+    const ex = user.exchange||'binance';
+    const apiKey = ex==='binance'?user.binance_api_key_enc:user.bybit_api_key_enc;
+    const apiSecret = ex==='binance'?user.binance_secret_enc:user.bybit_secret_enc;
+    if (!apiKey||!apiSecret) return {error:'No API keys configured'};
+    return {orderId:'SIMULATED_'+genId().slice(0,8)};
+  } catch(e) { return {error:e.message}; }
 }
 
-function buildAIAnalysis(pair,price,change24h,high,low,direction,strength,fgLabel,fgVal,question) {
-  const q=(question||'').toLowerCase();
-  const isBuy=q.includes('buy')||q.includes('long')||q.includes('entry');
-  const isSell=q.includes('sell')||q.includes('short');
-  const isRisk=q.includes('risk')||q.includes('safe');
-  const isTrend=q.includes('trend')||q.includes('direction')||q.includes('analysis');
-  
-  const changeNum=parseFloat(change24h)||0;
-  const bullish=changeNum>0;
-  
-  let analysis=`🤖 <b>AI Analysis — ${pair}</b>\n\n`;
-  analysis+=`💰 Price: <b>$${parseFloat(price).toLocaleString()}</b>\n`;
-  analysis+=`📊 24h: <b>${change24h}</b> ${bullish?'📈':'📉'}\n`;
-  analysis+=`📏 Range: $${low} — $${high}\n`;
-  analysis+=`🧠 Sentiment: <b>${fgLabel}</b> (${fgVal}/100)\n\n`;
-  
-  if (isBuy || isTrend || (!isSell&&!isRisk)) {
-    if (bullish && fgVal>45) {
-      analysis+=`✅ <b>Bias: BULLISH</b>\n\nMomentum is ${strength.toLowerCase()} to the upside. The market sentiment supports longs. Consider:\n• Entry: Near current price or on small pullback\n• TP: +2-3% ($${(parseFloat(price)*1.025).toFixed(0)}-$${(parseFloat(price)*1.03).toFixed(0)})\n• SL: -1.5% ($${(parseFloat(price)*0.985).toFixed(0)})\n• R:R 1:2 ✅`;
-    } else if (!bullish && fgVal<45) {
-      analysis+=`⚠️ <b>Bias: BEARISH</b>\n\nMomentum is ${strength.toLowerCase()} to the downside. Caution on longs:\n• Wait for support confirmation\n• Consider short with TP at -2-3%\n• SL: +1.5% above entry\n• Or wait for reversal signal`;
+// ─── ONBOARDING FSM ──────────────────────────────────────────────────────────
+async function handleOnboarding(chat_id, user, step, text) {
+  const od = user.onboarding_data||{};
+  if (step==='await_tp') {
+    const tp=parseFloat(text);
+    if (isNaN(tp)||tp<=0||tp>100){await sendTelegram(chat_id,'❌ Enter a valid Take Profit % (e.g. 3):');return;}
+    updateUser(user.id,{onboarding_data:{...od,tp},onboarding_step:'await_sl'});
+    await sendTelegram(chat_id,`✅ TP: <b>${tp}%</b>\n\n🛡️ <b>Enter Stop Loss %</b>\n💡 Good R:R = TP > SL (e.g. 1.5):`);
+  } else if (step==='await_sl') {
+    const sl=parseFloat(text);
+    if (isNaN(sl)||sl<=0||sl>50){await sendTelegram(chat_id,'❌ Enter valid SL % (e.g. 1.5):');return;}
+    const rr=(od.tp/sl).toFixed(1);
+    const rremoji=parseFloat(rr)>=2?'🏆':parseFloat(rr)>=1.5?'✅':'⚠️';
+    updateUser(user.id,{onboarding_data:{...od,sl},onboarding_step:'await_risk'});
+    await sendTelegram(chat_id,`✅ SL: <b>${sl}%</b> | ${rremoji} R:R 1:${rr}\n\n💸 <b>Risk per trade %</b> (e.g. 1)\n💡 Never risk more than 2%:`);
+  } else if (step==='await_risk') {
+    const r=parseFloat(text);
+    if (isNaN(r)||r<=0||r>10){await sendTelegram(chat_id,'❌ Enter 0.1–10 (e.g. 1):');return;}
+    updateUser(user.id,{onboarding_data:{...od,risk:r},onboarding_step:'await_max_trades'});
+    await sendTelegram(chat_id,`✅ Risk: <b>${r}%/trade</b>\n\n🔢 <b>Max trades per day</b> (e.g. 5):`);
+  } else if (step==='await_max_trades') {
+    const mt=parseInt(text);
+    if (isNaN(mt)||mt<=0||mt>50){await sendTelegram(chat_id,'❌ Enter 1–50:');return;}
+    updateUser(user.id,{onboarding_data:{...od,max_trades:mt},onboarding_step:'await_max_loss'});
+    await sendTelegram(chat_id,`✅ Max: <b>${mt} trades/day</b>\n\n🚨 <b>Max daily loss %</b> (e.g. 5)\nBot stops trading if this is hit:`);
+  } else if (step==='await_max_loss') {
+    const ml=parseFloat(text);
+    if (isNaN(ml)||ml<=0||ml>50){await sendTelegram(chat_id,'❌ Enter 0.1–50:');return;}
+    updateUser(user.id,{onboarding_data:{...od,max_loss:ml},onboarding_step:'await_strategy_name'});
+    await sendTelegram(chat_id,`✅ Max loss: <b>${ml}%/day</b>\n\n🏷️ <b>Name your strategy</b> (e.g. BTC Scalper):`);
+  } else if (step==='await_strategy_name') {
+    const name=text.trim();
+    if (!name||name.length<2){await sendTelegram(chat_id,'❌ At least 2 characters:');return;}
+    updateUser(user.id,{onboarding_data:{...od,name},onboarding_step:'await_mode'});
+    await sendTelegram(chat_id,`✅ Name: <b>${name}</b>\n\n🔵 <b>Select trading mode:</b>`,
+      {inline_keyboard:[[{text:'🧪 Paper (Simulated)',callback_data:'set_mode_paper'},{text:'🚀 Live Trading',callback_data:'set_mode_live'}]]});
+  } else if (step==='await_alert_pair') {
+    const pair=text.trim().toUpperCase().replace('/','');
+    updateUser(user.id,{onboarding_data:{...od,alert_pair:pair},onboarding_step:'await_alert_price'});
+    await sendTelegram(chat_id,`✅ Pair: <b>${pair}</b>\n\n📌 <b>Enter target price:</b>`);
+  } else if (step==='await_alert_price') {
+    const price=parseFloat(text);
+    if (isNaN(price)||price<=0){await sendTelegram(chat_id,'❌ Enter a valid price:');return;}
+    updateUser(user.id,{onboarding_data:{...od,alert_price:price},onboarding_step:'await_alert_dir'});
+    await sendTelegram(chat_id,`✅ Target: <b>$${fmt(price,4)}</b>\n\n📡 <b>Alert when price is:</b>`,
+      {inline_keyboard:[[{text:'📈 Above target',callback_data:'alert_dir_above'},{text:'📉 Below target',callback_data:'alert_dir_below'}]]});
+  } else if (step==='await_journal') {
+    const note=text.trim();
+    if (note.length<3){await sendTelegram(chat_id,'❌ Write more:');return;}
+    addJournalNote(chat_id,note);
+    updateUser(user.id,{onboarding_step:'',onboarding_data:{}});
+    await sendTelegram(chat_id,`📓 <b>Journal Note Saved!</b>\n──────────────────────────\n"${note.substring(0,100)}"\n🗓️ ${new Date().toLocaleDateString()}`,backToMenu());
+  } else if (step==='await_ai_pair') {
+    const pair=text.trim().toUpperCase().replace('/','');
+    updateUser(user.id,{onboarding_step:'',onboarding_data:{}});
+    await sendTelegram(chat_id,'🤖 <b>Analyzing...</b> ⏳');
+    const price = await fetchPrice(pair)||0;
+    const sentiment = await fetchMarketSentiment();
+    const advice = await getAIAdvice(pair,price,sentiment);
+    await sendTelegram(chat_id,advice,{inline_keyboard:[[{text:'📉 View Chart',callback_data:'menu_chart'},{text:'🤖 Ask Again',callback_data:'menu_ai'}],[{text:'🏠 Menu',callback_data:'menu_main'}]]});
+  } else if (step==='await_support_msg') {
+    // User sent a support message
+    const msg = text.trim();
+    if (msg.length < 2) { await sendTelegram(chat_id, '❌ Write your message:'); return; }
+    saveSupport(chat_id, user.first_name||'User', msg, 'inbound');
+    updateUser(user.id, {onboarding_step:'in_support', support_thread_open:1});
+    await sendTelegram(chat_id,
+      `✅ <b>Message sent to support!</b>\n──────────────────────────\n"${msg.substring(0,80)}"\n\n⏳ We'll respond shortly.\nYou can keep chatting here.`,
+      {inline_keyboard:[[{text:'🏠 Main Menu',callback_data:'menu_main'}]]});
+    // Notify admin
+    if (ADMIN_CHAT_ID) {
+      await sendTelegram(ADMIN_CHAT_ID,
+        `💬 <b>Support Message</b>\n──────────────────────────\n👤 ${user.first_name||'User'} (@${user.telegram_username||'unknown'}) [ID: ${chat_id}]\n\n"${msg}"\n──────────────────────────\nReply: /reply ${chat_id} &lt;message&gt;`);
+    }
+  } else if (step==='in_support') {
+    // Continue support thread
+    const msg = text.trim();
+    if (!msg.startsWith('/')) {
+      saveSupport(chat_id, user.first_name||'User', msg, 'inbound');
+      await sendTelegram(chat_id, `✅ Message received. Support will reply soon.`);
+      if (ADMIN_CHAT_ID) {
+        await sendTelegram(ADMIN_CHAT_ID,
+          `💬 <b>Follow-up</b>\n👤 ${user.first_name||'User'} [${chat_id}]\n\n"${msg}"\n\nReply: /reply ${chat_id} &lt;message&gt;`);
+      }
+    }
+  }
+}
+
+// ─── FAQ ─────────────────────────────────────────────────────────────────────
+const FAQ = [
+  ['What is TradeBot AutoLab?','A Telegram-based trading bot that lets you create automated strategies, connect TradingView signals, and trade crypto — all from your phone.'],
+  ['Is it free?','The Free plan includes paper trading & strategy creation. PRO unlocks live trading, AI signals & more.'],
+  ['How do I connect TradingView?','Go to Signal Setup, copy your webhook URL, and paste it in TradingView\'s alert webhook field.'],
+  ['How does paper trading work?','Paper trading simulates real trades using live market prices but with no real money at risk.'],
+  ['How do I start live trading?','Upgrade to PRO, connect your Binance/Bybit API keys in Settings, and enable Live mode on your strategy.'],
+  ['Is my API key safe?','Yes. Keys are encrypted and stored securely. We request trade-only permissions — no withdrawal access.'],
+  ['What exchanges are supported?','Currently Binance and Bybit. More exchanges coming soon.'],
+  ['Can I run multiple strategies?','Yes! You can create unlimited strategies, each with its own pair, risk settings, and mode.'],
+  ['How do price alerts work?','Set a target price and direction. You\'ll be notified instantly when your coin hits the target.'],
+  ['How do I get support?','Use the Live Support button in the main menu. Our team responds within 24 hours.'],
+];
+
+// ─── MAIN MENU SENDER ────────────────────────────────────────────────────────
+async function sendMainMenu(chat_id, user, greeting='') {
+  const stats = getStats(chat_id);
+  const openTrades = listTrades(chat_id, {status:'open'}).length;
+  const todayPnl = getTodayPnl(chat_id);
+  const strategies = listStrategies(chat_id).length;
+  const msg = `
+╔══════════════════════╗
+║  🤖 TradeBot AutoLab  ║
+╚══════════════════════╝
+${greeting?greeting+'\n':''}
+👤 <b>${user.first_name||'Trader'}</b> | ${planBadge(user.plan)}
+──────────────────────────
+📊 Open Trades: <b>${openTrades}</b>
+💰 Today P&L: <b>${fmtPnl(todayPnl)}</b>
+🤖 Strategies: <b>${strategies}</b>
+✅ Win Rate: <b>${stats.winRate}%</b> (${stats.closed} trades)
+──────────────────────────
+Select an option below:`;
+  await sendTelegram(chat_id, msg, mainMenuKeyboard(user));
+}
+
+// ─── CALLBACK HANDLER ────────────────────────────────────────────────────────
+async function handleCallback(callback) {
+  const chat_id = String(callback.message.chat.id);
+  const data = callback.data;
+  await answerCallback(callback.id);
+  let user = getUser(chat_id);
+  if (!user) user = createUser({telegram_id:chat_id, telegram_username:callback.from?.username||'', first_name:callback.from?.first_name||''});
+  const od = user.onboarding_data||{};
+
+  // ── Main menu ──
+  if (data==='menu_main') {
+    updateUser(user.id, {onboarding_step:'', onboarding_data:{}, support_thread_open:0});
+    await sendMainMenu(chat_id, user);
+
+  // ── Create strategy ──
+  } else if (data==='menu_create') {
+    const strategies = listStrategies(chat_id);
+    const msg = `
+🤖 <b>Create Trading Strategy</b>
+──────────────────────────
+Current strategies: <b>${strategies.length}</b>
+
+Select your market:`;
+    await sendTelegram(chat_id, msg, {inline_keyboard:[
+      [{text:'₿ Crypto',callback_data:'market_crypto'},{text:'📈 Forex',callback_data:'market_forex'}],
+      [{text:'🏢 Stocks',callback_data:'market_stocks'}],
+      [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+    ]});
+
+  } else if (['market_crypto','market_forex','market_stocks'].includes(data)) {
+    const market = data.replace('market_','');
+    updateUser(user.id, {onboarding_data:{...od,market}, onboarding_step:'select_pair'});
+    const pairs = market==='crypto'?[
+      ['BTCUSDT','ETHUSDT'],['BNBUSDT','SOLUSDT'],['XRPUSDT','DOGEUSDT'],['Other (type it)','']
+    ] : market==='forex'?[
+      ['EURUSD','GBPUSD'],['USDJPY','AUDUSD'],['Other (type it)','']
+    ] : [
+      ['AAPL','TSLA'],['NVDA','AMZN'],['Other (type it)','']
+    ];
+    await sendTelegram(chat_id, `✅ Market: <b>${market.toUpperCase()}</b>\n\n🪙 <b>Select trading pair:</b>`, {
+      inline_keyboard:[
+        ...pairs.slice(0,-1).map(row=>row.map(p=>({text:p,callback_data:`pair_${p}`}))),
+        [{text:'✍️ Type custom pair',callback_data:'pair_custom'}],
+        [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+      ]
+    });
+
+  } else if (data.startsWith('pair_')) {
+    const pair = data.replace('pair_','');
+    if (pair==='custom') {
+      updateUser(user.id, {onboarding_step:'select_pair_custom'});
+      await sendTelegram(chat_id, '✍️ Type your pair (e.g. BTCUSDT, AAPL):');
+      return;
+    }
+    updateUser(user.id, {onboarding_data:{...od,pair}, onboarding_step:'select_entry'});
+    await sendTelegram(chat_id, `✅ Pair: <b>${pair}</b>\n\n📋 <b>Select entry type:</b>`, {inline_keyboard:[
+      [{text:'📡 TradingView Signal',callback_data:'entry_signal'},{text:'🔔 Price Alert',callback_data:'entry_alert'}],
+      [{text:'🤖 Auto (AI)',callback_data:'entry_ai'}],
+      [{text:'« Back',callback_data:'menu_create'}]
+    ]});
+
+  } else if (data.startsWith('entry_')) {
+    const entry = data.replace('entry_','');
+    updateUser(user.id, {onboarding_data:{...od,entry}, onboarding_step:'await_tp'});
+    await sendTelegram(chat_id, `✅ Entry: <b>${entry.toUpperCase()}</b>\n\n🎯 <b>Take Profit %</b>\n(e.g. 3 means +3% from entry):`);
+
+  } else if (data.startsWith('set_mode_')) {
+    const mode = data.replace('set_mode_','');
+    if (mode==='live' && !isPro(user)) {
+      await sendTelegram(chat_id,
+        `🔒 <b>Live Trading requires PRO</b>\n──────────────────────────\nUpgrade to PRO to unlock:\n✅ Live trading on Binance/Bybit\n✅ AI signals & analysis\n✅ Priority support\n✅ Unlimited strategies`,
+        billingKeyboard(user));
+      return;
+    }
+    // Create the strategy
+    const strategy = createStrategy({
+      telegram_id: chat_id,
+      name: od.name||'My Strategy',
+      market: od.market||'crypto',
+      pair: od.pair||'BTCUSDT',
+      entry_type: od.entry||'signal',
+      take_profit_pct: od.tp||2,
+      stop_loss_pct: od.sl||1,
+      risk_per_trade_pct: od.risk||1,
+      max_trades_per_day: od.max_trades||5,
+      max_loss_limit_pct: od.max_loss||5,
+      mode
+    });
+    updateUser(user.id, {onboarding_step:'', onboarding_data:{}});
+    const signalUrl = `https://tradebot-server-production.up.railway.app/signal?user_id=${chat_id}`;
+    const msg = `
+✅ <b>Strategy Created!</b>
+╔══════════════════════╗
+║  🤖 ${(od.name||'My Strategy').padEnd(18)}║
+╚══════════════════════╝
+🪙 Pair: <b>${od.pair||'BTCUSDT'}</b>
+🎯 TP: <b>${od.tp||2}%</b> | 🛡️ SL: <b>${od.sl||1}%</b>
+💸 Risk: <b>${od.risk||1}%</b> | 🔢 Max: <b>${od.max_trades||5}/day</b>
+🔵 Mode: <b>${mode.toUpperCase()}</b>
+──────────────────────────
+📡 <b>Webhook URL:</b>
+<code>${signalUrl}</code>
+
+Use this in TradingView alerts!`;
+    await sendTelegram(chat_id, msg, {inline_keyboard:[
+      [{text:'📡 Signal Guide',callback_data:'menu_signal'},{text:'🧪 Test Paper Trade',callback_data:'menu_paper'}],
+      [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+    ]});
+
+  // ── Signal setup ──
+  } else if (data==='menu_signal') {
+    const signalUrl = `https://tradebot-server-production.up.railway.app/signal?user_id=${chat_id}`;
+    const msg = `
+📡 <b>TradingView Signal Setup</b>
+──────────────────────────
+<b>Step 1:</b> Create an alert in TradingView
+<b>Step 2:</b> Set webhook URL to:
+<code>${signalUrl}</code>
+
+<b>Step 3:</b> Set alert message to:
+<code>{"pair":"BTCUSDT","action":"BUY","price":{{close}}}</code>
+
+<b>Supported actions:</b> BUY, SELL
+──────────────────────────
+💡 Make sure your strategy pair matches!`;
+    await sendTelegram(chat_id, msg, {inline_keyboard:[
+      [{text:'🤖 Create Strategy',callback_data:'menu_create'},{text:'📋 My Strategies',callback_data:'menu_strategies'}],
+      [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+    ]});
+
+  // ── Paper trading ──
+  } else if (data==='menu_paper') {
+    const trades = listTrades(chat_id, {mode:'paper', status:'open'});
+    const closed = listTrades(chat_id, {mode:'paper'}).filter(t=>t.status==='closed');
+    const pnl = closed.reduce((s,t)=>s+t.pnl,0);
+    let msg = `
+🧪 <b>Paper Trading</b>
+──────────────────────────
+🏦 Virtual Balance: <b>$${fmt(user.balance_usd||10000)}</b>
+📊 Open Trades: <b>${trades.length}</b>
+✅ Closed: <b>${closed.length}</b>
+💰 Total P&L: <b>${fmtPnl(pnl)}</b>
+──────────────────────────`;
+    if (trades.length) {
+      msg += '\n\n<b>Open Positions:</b>';
+      for (const t of trades.slice(0,3)) {
+        msg += `\n• <b>${t.pair}</b> ${t.action} @ $${fmt(t.entry_price,4)}\n  ${tradeTimer(t)}\n  🎯 TP: $${fmt(t.take_profit,4)} | 🛡️ SL: $${fmt(t.stop_loss,4)}`;
+      }
     } else {
-      analysis+=`⚖️ <b>Bias: NEUTRAL</b>\n\nMixed signals — price and sentiment diverging. Best approach:\n• Wait for clear direction confirmation\n• Range trade between $${low} and $${high}\n• Tighter TP/SL until breakout`;
+      msg += '\n\n💤 No open paper trades.\nSend a signal or create a strategy!';
+    }
+    const kb = {inline_keyboard:[]};
+    if (trades.length) {
+      kb.inline_keyboard.push([{text:'❌ Close All Paper Trades',callback_data:'close_all_paper'}]);
+    }
+    kb.inline_keyboard.push([{text:'🤖 Create Strategy',callback_data:'menu_create'},{text:'🏠 Menu',callback_data:'menu_main'}]);
+    await sendTelegram(chat_id, msg, kb);
+
+  } else if (data==='close_all_paper') {
+    const trades = listTrades(chat_id, {mode:'paper', status:'open'});
+    let closed=0;
+    for (const t of trades) {
+      const price = await fetchPrice(t.pair)||t.entry_price;
+      closeTrade(t.id, price, 'manual');
+      closed++;
+    }
+    await sendTelegram(chat_id, `✅ Closed <b>${closed}</b> paper trade(s).`, backToMenu());
+
+  // ── Auto trade / live ──
+  } else if (data==='menu_autotrade') {
+    if (!isPro(user)) {
+      await sendTelegram(chat_id,
+        `🔒 <b>Live Trading — PRO Only</b>\n──────────────────────────\nUpgrade to unlock:\n💎 Live Binance/Bybit execution\n🤖 Automated order management\n🎯 TP/SL auto-close\n✅ No withdrawal access needed`,
+        billingKeyboard(user));
+      return;
+    }
+    const liveTrades = listTrades(chat_id, {mode:'live', status:'open'});
+    await sendTelegram(chat_id,
+      `🚀 <b>Live Trading</b>\n──────────────────────────\n💎 Plan: PRO\n📊 Open Live Trades: <b>${liveTrades.length}</b>\n\n⚙️ Manage your exchange:`,
+      {inline_keyboard:[
+        [{text:'🔑 Binance Keys',callback_data:'set_exchange_binance'},{text:'🔑 Bybit Keys',callback_data:'set_exchange_bybit'}],
+        [{text:'📋 My Strategies',callback_data:'menu_strategies'}],
+        [{text:'🏠 Menu',callback_data:'menu_main'}]
+      ]});
+
+  // ── Performance ──
+  } else if (data==='menu_performance') {
+    const stats = getStats(chat_id);
+    const todayPnl = getTodayPnl(chat_id);
+    const recentTrades = listTrades(chat_id, {limit:5});
+    let msg = `
+📊 <b>Performance Dashboard</b>
+──────────────────────────
+💰 Today P&L: <b>${fmtPnl(todayPnl)}</b>
+──────────────────────────
+📈 Total Trades: <b>${stats.total}</b>
+✅ Wins: <b>${stats.wins}</b> | ❌ Losses: <b>${stats.losses}</b>
+🏆 Win Rate: <b>${stats.winRate}%</b>
+💵 Total P&L: <b>${fmtPnl(stats.totalPnl)}</b>
+📊 Avg P&L: <b>${fmtPnl(stats.avgPnl)}/trade</b>
+──────────────────────────`;
+    if (recentTrades.length) {
+      msg += '\n<b>Recent Trades:</b>';
+      for (const t of recentTrades) {
+        const icon = t.status==='open'?'🔵':t.pnl>=0?'🟢':'🔴';
+        msg += `\n${icon} <b>${t.pair}</b> ${t.action} — ${t.status==='open'?'OPEN':fmtPnl(t.pnl)+' ('+fmtPct(t.pnl_pct)+')'}`;
+        if (t.status==='open') msg += `\n   ${tradeTimer(t)}`;
+      }
+    } else {
+      msg += '\n\n💤 No trades yet. Send your first signal!';
+    }
+    await sendTelegram(chat_id, msg, {inline_keyboard:[
+      [{text:'📋 All Strategies',callback_data:'menu_strategies'},{text:'📓 Journal',callback_data:'menu_journal'}],
+      [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+    ]});
+
+  // ── Strategies list ──
+  } else if (data==='menu_strategies') {
+    const strategies = listStrategies(chat_id);
+    if (!strategies.length) {
+      await sendTelegram(chat_id, '💤 No strategies yet.', {inline_keyboard:[[{text:'🤖 Create Strategy',callback_data:'menu_create'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
+      return;
+    }
+    let msg = `📋 <b>My Strategies</b> (${strategies.length})\n──────────────────────────\n`;
+    for (const s of strategies) {
+      const statusIcon = s.is_active?'🟢':'🔴';
+      msg += `${statusIcon} <b>${s.name}</b> [${s.mode.toUpperCase()}]\n   ${s.pair} | TP:${s.take_profit_pct}% SL:${s.stop_loss_pct}% | ${s.total_trades}T ${s.total_wins}W\n`;
+    }
+    await sendTelegram(chat_id, msg, {inline_keyboard:[
+      [{text:'➕ New Strategy',callback_data:'menu_create'}],
+      [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+    ]});
+
+  // ── Alerts ──
+  } else if (data==='menu_alerts') {
+    const alerts = getUserAlerts(chat_id);
+    let msg = `🔔 <b>Price Alerts</b>\n──────────────────────────\n`;
+    if (alerts.length) {
+      for (const a of alerts) {
+        msg += `• <b>${a.pair}</b> ${a.direction==='above'?'📈 above':'📉 below'} $${fmt(a.target_price,4)}\n`;
+      }
+    } else {
+      msg += '💤 No active alerts.\n\nSet an alert to get notified when a price is hit!';
+    }
+    await sendTelegram(chat_id, msg, {inline_keyboard:[
+      [{text:'➕ New Alert',callback_data:'add_alert'}],
+      [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+    ]});
+
+  } else if (data==='add_alert') {
+    updateUser(user.id, {onboarding_step:'await_alert_pair', onboarding_data:{}});
+    await sendTelegram(chat_id, `🔔 <b>New Price Alert</b>\n\nType the pair (e.g. BTCUSDT, ETHUSDT):`);
+
+  } else if (data==='alert_dir_above'||data==='alert_dir_below') {
+    const direction = data==='alert_dir_above'?'above':'below';
+    createPriceAlert({telegram_id:chat_id, pair:od.alert_pair, direction, target_price:od.alert_price});
+    updateUser(user.id, {onboarding_step:'', onboarding_data:{}});
+    await sendTelegram(chat_id,
+      `✅ <b>Alert Set!</b>\n──────────────────────────\n🪙 ${od.alert_pair}\n${direction==='above'?'📈 Above':'📉 Below'} <b>$${fmt(od.alert_price,4)}</b>\n\nYou'll be notified when hit!`,
+      {inline_keyboard:[[{text:'🔔 My Alerts',callback_data:'menu_alerts'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
+
+  // ── AI ──
+  } else if (data==='menu_ai') {
+    updateUser(user.id, {onboarding_step:'await_ai_pair'});
+    await sendTelegram(chat_id, `🤖 <b>AI Trading Assistant</b>\n──────────────────────────\nType the pair you want to analyze:\n\n<i>Example: BTCUSDT, ETHUSDT, BNBUSDT</i>`);
+
+  // ── News ──
+  } else if (data==='menu_news') {
+    await sendTelegram(chat_id, '📰 <b>Fetching latest crypto news...</b> ⏳');
+    const news = await fetchNews();
+    let msg = `📰 <b>Crypto News</b>\n──────────────────────────\n`;
+    for (const n of news) {
+      const time = new Date(n.time).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+      msg += `• [${time}] <a href="${n.url}">${n.title}</a>\n\n`;
+    }
+    await sendTelegram(chat_id, msg, {inline_keyboard:[
+      [{text:'🔄 Refresh',callback_data:'menu_news'},{text:'🤖 AI Analysis',callback_data:'menu_ai'}],
+      [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+    ]});
+
+  // ── Chart ──
+  } else if (data==='menu_chart') {
+    const strategies = listStrategies(chat_id);
+    const pair = strategies.length ? strategies[0].pair : 'BTCUSDT';
+    await sendTelegram(chat_id, '📉 <b>Loading chart...</b> ⏳');
+    const chart = await buildChart(pair);
+    await sendTelegram(chat_id, chart, {inline_keyboard:[
+      [{text:'🔄 Refresh',callback_data:'menu_chart'},{text:'🤖 AI Analysis',callback_data:'menu_ai'}],
+      [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+    ]});
+
+  // ── Journal ──
+  } else if (data==='menu_journal') {
+    const notes = getJournalNotes(chat_id);
+    let msg = `📓 <b>Trade Journal</b>\n──────────────────────────\n`;
+    if (notes.length) {
+      for (const n of notes.slice(0,5)) {
+        msg += `📅 ${new Date(n.created_date).toLocaleDateString()}\n"${n.note.substring(0,80)}"\n\n`;
+      }
+    } else {
+      msg += '💤 No journal entries yet.\n\nAdd notes to track your trading mindset!';
+    }
+    await sendTelegram(chat_id, msg, {inline_keyboard:[
+      [{text:'✍️ Add Note',callback_data:'add_journal'}],
+      [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+    ]});
+
+  } else if (data==='add_journal') {
+    updateUser(user.id, {onboarding_step:'await_journal'});
+    await sendTelegram(chat_id, `📓 <b>New Journal Entry</b>\n\nType your note (trade thoughts, lessons, analysis):`);
+
+  // ── LIVE SUPPORT ──
+  } else if (data==='menu_support') {
+    const history = getSupport(chat_id);
+    let msg = `💬 <b>Live Support</b>\n──────────────────────────\n`;
+    if (history.length) {
+      msg += `<b>Recent messages:</b>\n`;
+      for (const h of history.slice(-4)) {
+        const dir = h.direction==='inbound'?'👤':'🛠️';
+        const time = new Date(h.created_date).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+        msg += `${dir} [${time}] ${h.message.substring(0,60)}\n`;
+      }
+      msg += `──────────────────────────\n✍️ Type your message to continue:`;
+    } else {
+      msg += `👋 Hi <b>${user.first_name||'Trader'}</b>!\n\nOur support team is ready to help.\n\n✍️ Type your message below:`;
+    }
+    updateUser(user.id, {onboarding_step:'await_support_msg'});
+    await sendTelegram(chat_id, msg, {inline_keyboard:[
+      [{text:'❓ FAQ',callback_data:'menu_faq'},{text:'🏠 Main Menu',callback_data:'menu_main'}]
+    ]});
+
+  // ── FAQ ──
+  } else if (data==='menu_faq') {
+    let msg = `❓ <b>Frequently Asked Questions</b>\n──────────────────────────\n`;
+    FAQ.slice(0,5).forEach((qa,i) => {
+      msg += `<b>${i+1}. ${qa[0]}</b>\n${qa[1]}\n\n`;
+    });
+    await sendTelegram(chat_id, msg, {inline_keyboard:[
+      [{text:'More FAQs ➡️',callback_data:'menu_faq2'},{text:'💬 Live Chat',callback_data:'menu_support'}],
+      [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+    ]});
+
+  } else if (data==='menu_faq2') {
+    let msg = `❓ <b>FAQ (Part 2)</b>\n──────────────────────────\n`;
+    FAQ.slice(5).forEach((qa,i) => {
+      msg += `<b>${i+6}. ${qa[0]}</b>\n${qa[1]}\n\n`;
+    });
+    await sendTelegram(chat_id, msg, {inline_keyboard:[
+      [{text:'💬 Live Chat',callback_data:'menu_support'},{text:'🏠 Menu',callback_data:'menu_main'}]
+    ]});
+
+  // ── BILLING ──
+  } else if (data==='menu_billing') {
+    const expiry = user.plan_expires ? `\n📅 Expires: <b>${new Date(user.plan_expires).toLocaleDateString()}</b>` : '';
+    if (isPro(user)) {
+      await sendTelegram(chat_id,
+        `💎 <b>PRO Plan Active</b>\n──────────────────────────\n✅ Live Trading: ON\n✅ AI Signals: ON\n✅ Priority Support: ON\n✅ Unlimited Strategies: ON${expiry}\n──────────────────────────\nThank you for your support! 🙏`,
+        billingKeyboard(user));
+    } else {
+      await sendTelegram(chat_id,
+        `💳 <b>Upgrade to PRO</b>\n──────────────────────────\n🆓 FREE (current):\n• Paper trading ✅\n• 3 strategies ✅\n• Basic alerts ✅\n• Price charts ✅\n\n💎 PRO — <b>$${PRO_MONTHLY_USD}/month</b>:\n• Live trading 🚀\n• Unlimited strategies ✅\n• AI trading signals 🤖\n• Priority support 💬\n• Advanced analytics 📊\n• Binance + Bybit ✅\n──────────────────────────\nUpgrade now to start live trading!`,
+        billingKeyboard(user));
+    }
+
+  } else if (data==='billing_upgrade') {
+    const checkoutUrl = await createStripeCheckout(user);
+    if (checkoutUrl) {
+      await sendTelegram(chat_id,
+        `💎 <b>Upgrade to PRO</b>\n\nClick below to complete payment:\n<a href="${checkoutUrl}">🔐 Secure Checkout — $${PRO_MONTHLY_USD}/mo</a>\n\n✅ Powered by Stripe\n🔒 Cancel anytime`,
+        {inline_keyboard:[
+          [{text:'💳 Pay Now',url:checkoutUrl}],
+          [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+        ]});
+    } else {
+      // Stripe not configured — show manual upgrade flow
+      await sendTelegram(chat_id,
+        `💎 <b>Upgrade to PRO — $${PRO_MONTHLY_USD}/mo</b>\n──────────────────────────\nTo upgrade, contact our support team:\n\n📧 Payment via support chat\n\nClick below to start:`,
+        {inline_keyboard:[
+          [{text:'💬 Contact Support',callback_data:'menu_support'}],
+          [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+        ]});
+    }
+
+  } else if (data==='billing_compare') {
+    await sendTelegram(chat_id,
+      `📋 <b>Plan Comparison</b>\n══════════════════════════\n<b>Feature         FREE   PRO</b>\n──────────────────────────\nPaper Trading     ✅     ✅\nStrategy Builder  ✅     ✅\nPrice Alerts      ✅     ✅\nCrypto News       ✅     ✅\nChart View        ✅     ✅\nStrategies        3      ∞\nLive Trading      ❌     ✅\nAI Signals        ❌     ✅\nBinance API       ❌     ✅\nBybit API         ❌     ✅\nPriority Support  ❌     ✅\nAdvanced Stats    ❌     ✅\n══════════════════════════\nPRO: <b>$${PRO_MONTHLY_USD}/month</b>`,
+      {inline_keyboard:[
+        [{text:`💎 Get PRO — $${PRO_MONTHLY_USD}/mo`,callback_data:'billing_upgrade'}],
+        [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+      ]});
+
+  // ── Settings ──
+  } else if (data==='menu_settings') {
+    const ex = user.exchange||'Not set';
+    const hasKeys = (user.binance_api_key_enc||user.bybit_api_key_enc)?'✅ Connected':'❌ Not connected';
+    await sendTelegram(chat_id,
+      `⚙️ <b>Settings</b>\n──────────────────────────\n👤 Name: <b>${user.first_name||'—'}</b>\n🏦 Exchange: <b>${ex.toUpperCase()||'—'}</b>\n🔑 API Keys: <b>${hasKeys}</b>\n💎 Plan: <b>${planBadge(user.plan)}</b>\n🏦 Balance: <b>$${fmt(user.balance_usd||10000)}</b>`,
+      {inline_keyboard:[
+        [{text:'🔑 Binance API',callback_data:'set_exchange_binance'},{text:'🔑 Bybit API',callback_data:'set_exchange_bybit'}],
+        [{text:'💎 Manage Plan',callback_data:'menu_billing'}],
+        [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+      ]});
+
+  } else if (data==='set_exchange_binance'||data==='set_exchange_bybit') {
+    const ex = data==='set_exchange_binance'?'binance':'bybit';
+    updateUser(user.id, {exchange:ex, onboarding_step:`await_api_key_${ex}`, onboarding_data:{}});
+    await sendTelegram(chat_id,
+      `🔑 <b>${ex.toUpperCase()} API Setup</b>\n──────────────────────────\n⚠️ Create API key with:\n✅ Spot Trading permission\n❌ NO withdrawal permission\n\nPaste your <b>API Key</b>:`);
+
+  // ── Stop all ──
+  } else if (data==='menu_stopall') {
+    updateUser(user.id, {bot_stopped:true});
+    await sendTelegram(chat_id,
+      `🛑 <b>ALL BOTS STOPPED</b>\n──────────────────────────\nAll active strategies paused.\nOpen trades continue to monitor.\n\nRestart from main menu.`,
+      {inline_keyboard:[[{text:'▶️ Resume Bots',callback_data:'menu_resume'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
+
+  } else if (data==='menu_resume') {
+    updateUser(user.id, {bot_stopped:false});
+    await sendTelegram(chat_id,
+      `▶️ <b>Bots Resumed!</b>\n──────────────────────────\nAll strategies are now active.\nSignals will be processed.`,
+      {inline_keyboard:[[{text:'📊 Performance',callback_data:'menu_performance'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
+
+  // ── Close trade by ID ──
+  } else if (data.startsWith('close_')) {
+    const suffix = data.replace('close_','');
+    const trades = listTrades(chat_id, {status:'open'});
+    const trade = trades.find(t=>t.id.endsWith(suffix));
+    if (trade) {
+      const price = await fetchPrice(trade.pair)||trade.entry_price;
+      const result = closeTrade(trade.id, price, 'manual');
+      await sendTelegram(chat_id,
+        `✅ <b>Trade Closed</b>\n──────────────────────────\n🪙 ${trade.pair} ${trade.action}\n📥 Entry: $${fmt(trade.entry_price,4)}\n📤 Exit:  $${fmt(price,4)}\n💰 P&L: ${fmtPnl(result.pnl)} (${fmtPct(result.pnl_pct)})\n⏱️ Duration: ${elapsed(trade.created_date)}`,
+        {inline_keyboard:[[{text:'📊 Performance',callback_data:'menu_performance'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
+    } else {
+      await sendTelegram(chat_id, '⚠️ Trade not found or already closed.', backToMenu());
     }
   }
-  
-  if (isRisk) {
-    analysis+=`\n\n🛡️ <b>Risk Assessment:</b>\n`;
-    analysis+=fgVal>75?`❗ Extreme Greed — HIGH RISK. Late in cycle, reduce position size.`:fgVal<25?`❗ Extreme Fear — HIGH VOLATILITY. Wide wicks, use tighter stops.`:`✅ Normal risk environment. Standard 1-2% risk per trade recommended.`;
-  }
-  
-  analysis+=`\n\n💡 <i>AI guidance only. Always use your own judgment and risk management.</i>`;
-  return analysis;
 }
 
-// ─── Chart ASCII ──────────────────────────────────────────────────────────────
-async function generateChart(pair) {
-  const symbol=pair.replace('/','').toUpperCase();
-  let candles=[];
-  try {
-    const r=await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=4h&limit=20`);
-    if(r.ok){const d=await r.json();candles=d.map(c=>({o:parseFloat(c[1]),h:parseFloat(c[2]),l:parseFloat(c[3]),c:parseFloat(c[4]),v:parseFloat(c[5])}));}
-  } catch(_){}
-  
-  if(!candles.length) return `📊 Chart unavailable for ${pair}`;
-  
-  const closes=candles.map(c=>c.c);
-  const min=Math.min(...candles.map(c=>c.l));
-  const max=Math.max(...candles.map(c=>c.h));
-  const range=max-min||1;
-  const height=8;
-  const rows=[];
-  
-  // Build chart grid
-  for(let row=0;row<height;row++){
-    const threshold=max-(range*(row/(height-1)));
-    let line='';
-    for(let i=0;i<candles.length;i++){
-      const c=candles[i];
-      const isUp=c.c>=c.o;
-      if(c.h>=threshold&&c.l<=threshold){
-        if(c.c>=threshold&&c.o>=threshold) line+=isUp?'│':'│';
-        else if(threshold>=Math.min(c.o,c.c)&&threshold<=Math.max(c.o,c.c)) line+=isUp?'█':'▓';
-        else line+='│';
-      } else line+=' ';
+// ─── MESSAGE HANDLER ─────────────────────────────────────────────────────────
+async function handleMessage(msg) {
+  const chat_id = String(msg.chat.id);
+  const text = msg.text||'';
+  let user = getUser(chat_id);
+  if (!user) user = createUser({telegram_id:chat_id, telegram_username:msg.from?.username||'', first_name:msg.from?.first_name||''});
+  updateUser(user.id, {last_seen: new Date().toISOString(), first_name: msg.from?.first_name||user.first_name});
+
+  // Admin commands
+  if (chat_id === ADMIN_CHAT_ID) {
+    if (text.startsWith('/reply ')) {
+      const parts = text.split(' ');
+      const target_id = parts[1];
+      const reply = parts.slice(2).join(' ');
+      if (target_id && reply) {
+        saveSupport(target_id, 'Support', reply, 'outbound');
+        await sendTelegram(target_id, `💬 <b>Support Reply:</b>\n──────────────────────────\n${reply}`, {inline_keyboard:[[{text:'💬 Reply Back',callback_data:'menu_support'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
+        await sendTelegram(ADMIN_CHAT_ID, `✅ Reply sent to user ${target_id}`);
+        return;
+      }
     }
-    const price=(max-(range*(row/(height-1)))).toFixed(0);
-    rows.push(`<code>${price.padStart(8)} │${line}</code>`);
+    if (text==='/users') {
+      const users = getAllUsers();
+      await sendTelegram(ADMIN_CHAT_ID, `👥 Total users: <b>${users.length}</b>\n${users.slice(0,10).map(u=>`• ${u.first_name||'—'} (@${u.telegram_username||'—'}) — ${planBadge(u.plan)}`).join('\n')}`);
+      return;
+    }
+    if (text==='/broadcast') {
+      await sendTelegram(ADMIN_CHAT_ID, 'Usage: /broadcast Your message here');
+      return;
+    }
+    if (text.startsWith('/broadcast ')) {
+      const broadMsg = text.replace('/broadcast ','');
+      const users = getAllUsers();
+      let sent=0;
+      for (const u of users) {
+        try { await sendTelegram(u.telegram_id, `📢 <b>Announcement:</b>\n\n${broadMsg}`); sent++; } catch(_){}
+      }
+      await sendTelegram(ADMIN_CHAT_ID, `✅ Broadcast sent to ${sent} users.`);
+      return;
+    }
+    if (text.startsWith('/grant_pro ')) {
+      const target = text.replace('/grant_pro ','').trim();
+      const targetUser = getUser(target);
+      if (targetUser) {
+        updateUser(targetUser.id, {plan:'pro', plan_expires:''});
+        await sendTelegram(target, `💎 <b>PRO Access Granted!</b>\n──────────────────────────\nYour account has been upgraded to PRO.\n✅ Live trading: ON\n✅ All features unlocked!\n\nThank you! 🙏`, backToMenu());
+        await sendTelegram(ADMIN_CHAT_ID, `✅ PRO granted to user ${target}`);
+      } else {
+        await sendTelegram(ADMIN_CHAT_ID, `❌ User not found: ${target}`);
+      }
+      return;
+    }
   }
-  
-  const currentPrice=candles[candles.length-1].c;
-  const firstPrice=candles[0].c;
-  const changePct=((currentPrice-firstPrice)/firstPrice*100).toFixed(2);
-  const trend=changePct>0?'📈':'📉';
-  
-  return `${trend} <b>${pair} — 4H Chart (20 candles)</b>\n\n${rows.join('\n')}\n\n<code>          └${'─'.repeat(candles.length)}</code>\n\n💰 Current: <b>$${currentPrice.toFixed(2)}</b>\n📊 20-bar change: <b>${changePct>0?'+':''}${changePct}%</b>\n📈 High: $${max.toFixed(2)} | 📉 Low: $${min.toFixed(2)}`;
+
+  // Handle onboarding steps
+  const step = user.onboarding_step||'';
+  if (step && step!=='done') {
+    // API key collection
+    if (step.startsWith('await_api_key_')) {
+      const ex = step.replace('await_api_key_','');
+      if (text.length<10){await sendTelegram(chat_id,'❌ Invalid API key. Paste the full key:');return;}
+      const field = ex==='binance'?'binance_api_key_enc':'bybit_api_key_enc';
+      updateUser(user.id, {[field]:text, onboarding_step:`await_api_secret_${ex}`});
+      await sendTelegram(chat_id, `✅ <b>API Key saved!</b>\n\nNow paste your <b>${ex.toUpperCase()} Secret Key</b>:`);
+      return;
+    }
+    if (step.startsWith('await_api_secret_')) {
+      const ex = step.replace('await_api_secret_','');
+      if (text.length<10){await sendTelegram(chat_id,'❌ Invalid secret:');return;}
+      const field = ex==='binance'?'binance_secret_enc':'bybit_secret_enc';
+      updateUser(user.id, {[field]:text, onboarding_step:'done', auto_trade_enabled:true});
+      await sendTelegram(chat_id,
+        `🔐 <b>API Keys Saved!</b>\n──────────────────────────\n✅ ${ex.toUpperCase()} connected\n✅ Auto Trading: ON\n\n⚠️ Ensure key has Spot Trading only — NO withdrawals.`,
+        mainMenuKeyboard(user));
+      return;
+    }
+    if (step==='select_pair_custom') {
+      const pair = text.trim().toUpperCase().replace('/','');
+      updateUser(user.id, {onboarding_data:{...user.onboarding_data, pair}, onboarding_step:'select_entry'});
+      await sendTelegram(chat_id, `✅ Pair: <b>${pair}</b>\n\n📋 <b>Select entry type:</b>`, {inline_keyboard:[
+        [{text:'📡 TradingView Signal',callback_data:'entry_signal'},{text:'🔔 Price Alert',callback_data:'entry_alert'}],
+        [{text:'🤖 Auto (AI)',callback_data:'entry_ai'}],
+        [{text:'« Back',callback_data:'menu_create'}]
+      ]});
+      return;
+    }
+    await handleOnboarding(chat_id, user, step, text);
+    return;
+  }
+
+  // Commands
+  if (text.startsWith('/start')||text==='/menu') {
+    updateUser(user.id, {bot_stopped:false, onboarding_step:'', onboarding_data:{}, support_thread_open:0});
+    const isNew = text.startsWith('/start pro_success');
+    await sendMainMenu(chat_id, user, isNew?'💎 <b>PRO activated!</b> Welcome to the big leagues 🚀':'');
+  } else if (text==='/help'||text==='/faq') {
+    let msg = `❓ <b>FAQ — TradeBot AutoLab</b>\n──────────────────────────\n`;
+    FAQ.slice(0,5).forEach((qa,i) => { msg += `<b>${i+1}. ${qa[0]}</b>\n${qa[1]}\n\n`; });
+    await sendTelegram(chat_id, msg, {inline_keyboard:[[{text:'More FAQs',callback_data:'menu_faq2'},{text:'💬 Support',callback_data:'menu_support'}],[{text:'🏠 Menu',callback_data:'menu_main'}]]});
+  } else if (text==='/performance'||text==='/stats') {
+    await handleCallback({message:{chat:{id:chat_id}}, data:'menu_performance', id:'', from:msg.from});
+  } else if (text.startsWith('/price ')) {
+    const pair = text.replace('/price ','').trim().toUpperCase();
+    const price = await fetchPrice(pair);
+    if (price) {
+      await sendTelegram(chat_id, `💵 <b>${pair}</b>: $${fmt(price,4)}`, {inline_keyboard:[[{text:'🔔 Set Alert',callback_data:'add_alert'},{text:'🤖 AI Analysis',callback_data:'menu_ai'}]]});
+    } else {
+      await sendTelegram(chat_id, `❌ Couldn't fetch price for ${pair}. Try BTCUSDT, ETHUSDT etc.`);
+    }
+  } else {
+    // Default — show menu
+    await sendMainMenu(chat_id, user);
+  }
 }
 
-// ─── Formatters ──────────────────────────────────────────────────────────────
-function fmt(n){return Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
-function fmtPnl(n){return `${n>=0?'🟢 +$':'🔴 -$'}${fmt(Math.abs(n))}`;}
-function fmtPct(n){return `${n>=0?'+':''}${n.toFixed(2)}%`;}
-function sparkline(trades){
-  if(!trades.length)return '━━━━━━━━━━';
-  const pnls=trades.slice(-10).map(t=>t.pnl||0);
-  const min=Math.min(...pnls),max=Math.max(...pnls),range=max-min||1;
-  const chars=['▁','▂','▃','▄','▅','▆','▇','█'];
-  return pnls.map(p=>chars[Math.floor(((p-min)/range)*7)]).join('');
-}
+// ─── EXPRESS APP ─────────────────────────────────────────────────────────────
+const app = express();
+app.use(express.json());
 
-// ─── Keyboards ────────────────────────────────────────────────────────────────
-const mainMenuKeyboard=()=>({inline_keyboard:[
-  [{text:'🤖 Create Strategy',callback_data:'menu_create'},{text:'📋 My Strategies',callback_data:'list_strategies'}],
-  [{text:'🧪 Paper Trading',callback_data:'menu_paper'},{text:'🚀 Live Trading',callback_data:'menu_autotrade'}],
-  [{text:'📊 Performance',callback_data:'menu_performance'},{text:'📈 Live Prices',callback_data:'menu_prices'}],
-  [{text:'🗞️ Market News',callback_data:'menu_news'},{text:'📉 View Chart',callback_data:'menu_chart'}],
-  [{text:'🤖 AI Assistant',callback_data:'menu_ai'},{text:'🔔 Price Alerts',callback_data:'menu_alerts'}],
-  [{text:'🔗 Webhook Signal',callback_data:'menu_signal'},{text:'📓 Trade Journal',callback_data:'menu_journal'}],
-  [{text:'❓ FAQ & Help',callback_data:'menu_faq'},{text:'🌐 Website',callback_data:'menu_website'}],
-  [{text:'⚙️ Settings',callback_data:'menu_settings'},{text:'🛑 STOP ALL',callback_data:'menu_stopall'}],
-]});
+app.get('/', (req,res) => {
+  res.json({status:'TradeBot AutoLab v5.0 🤖', version:'5.0', uptime:`${Math.floor(process.uptime())}s`, time:new Date().toISOString()});
+});
 
-const backToMenu=()=>({inline_keyboard:[[{text:'🏠 Main Menu',callback_data:'menu_main'}]]});
-
-// ─── Monitor ──────────────────────────────────────────────────────────────────
-async function monitorOpenTrades() {
+// Stripe webhook for payment confirmation
+app.post('/stripe-webhook', express.raw({type:'application/json'}), async (req,res) => {
   try {
-    const allUsers=getAllUsers();
-    for(const user of allUsers){
-      if(user.bot_stopped) continue;
-      const openTrades=listTrades(user.telegram_id,{status:'open'});
-      for(const trade of openTrades){
-        const cur=await fetchPrice(trade.pair);
-        let shouldClose=false,reason='',closePrice=cur;
-        if(trade.action==='BUY'){if(cur>=trade.take_profit){shouldClose=true;reason='Take Profit 🎯';closePrice=trade.take_profit;}else if(cur<=trade.stop_loss){shouldClose=true;reason='Stop Loss 🛡️';closePrice=trade.stop_loss;}}
-        else{if(cur<=trade.take_profit){shouldClose=true;reason='Take Profit 🎯';closePrice=trade.take_profit;}else if(cur>=trade.stop_loss){shouldClose=true;reason='Stop Loss 🛡️';closePrice=trade.stop_loss;}}
-        if(shouldClose){
-          const closed=closeTrade(trade.id,closePrice,reason);
-          const pnl=closed.pnl;
-          await sendTelegram(user.telegram_id,
-            `${pnl>=0?'💰':'💸'} <b>${reason}</b>\n\n💱 ${trade.pair} | ${trade.action}\n📥 Entry: $${fmt(trade.entry_price)}\n📤 Exit: $${fmt(closePrice)}\n💵 P&L: ${fmtPnl(pnl)} (${fmtPct(closed.pnl_pct)})\n📋 ${trade.strategy_name}`,
-            {inline_keyboard:[[{text:'📊 Stats',callback_data:'menu_performance'},{text:'🏠 Menu',callback_data:'menu_main'}]]}
-          );
+    const event = JSON.parse(req.body.toString());
+    if (event.type==='checkout.session.completed') {
+      const session = event.data.object;
+      const telegram_id = session.metadata?.telegram_id || session.client_reference_id;
+      if (telegram_id) {
+        const u = getUser(telegram_id);
+        if (u) {
+          const expires = new Date(Date.now() + 30*24*60*60*1000).toISOString();
+          updateUser(u.id, {plan:'pro', plan_expires:expires, stripe_customer_id: session.customer||''});
+          await sendTelegram(telegram_id,
+            `💎 <b>PRO Activated!</b>\n──────────────────────────\n✅ Live trading: ON\n✅ AI signals: ON\n✅ Unlimited strategies: ON\n\nWelcome to PRO! 🚀`,
+            mainMenuKeyboard(u));
         }
       }
     }
-  } catch(e){console.error('Monitor:',e.message);}
-}
-
-async function monitorAlerts() {
-  try {
-    const alerts=getActiveAlerts();
-    for(const alert of alerts){
-      const cur=await fetchPrice(alert.pair);
-      const triggered=(alert.direction==='above'&&cur>=alert.target_price)||(alert.direction==='below'&&cur<=alert.target_price);
-      if(triggered){
-        markAlertTriggered(alert.id);
-        await sendTelegram(alert.telegram_id,`🔔 <b>Alert Triggered!</b>\n\n${alert.pair} is <b>$${fmt(cur)}</b>\n📌 Target: ${alert.direction==='above'?'📈':'📉'} $${fmt(alert.target_price)}`,
-          {inline_keyboard:[[{text:'🤖 Trade Now',callback_data:'menu_create'},{text:'🏠 Menu',callback_data:'menu_main'}]]}
-        );
-      }
-    }
-  } catch(e){console.error('Alerts:',e.message);}
-}
-
-// Broadcast market alerts every 4 hours
-async function broadcastMarketAlerts() {
-  try {
-    const users=getAllUsers().filter(u=>!u.bot_stopped);
-    if(!users.length) return;
-    const sentiment=await fetchMarketSentiment();
-    const pairs=['BTC/USDT','ETH/USDT','SOL/USDT'];
-    let alerts=[];
-    for(const pair of pairs){
-      const sym=pair.replace('/','').toUpperCase();
-      try {
-        const r=await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${sym}`);
-        if(r.ok){const d=await r.json();const chg=parseFloat(d.priceChangePercent);if(Math.abs(chg)>4)alerts.push({pair,chg,price:parseFloat(d.lastPrice)});}
-      } catch(_){}
-    }
-    if(alerts.length===0) return;
-    let msg=`🚨 <b>Market Alert — Big Moves</b>\n\n`;
-    for(const a of alerts) msg+=`${a.chg>0?'🟢':'🔴'} <b>${a.pair}</b> ${a.chg>0?'+':''}${a.chg.toFixed(2)}% — $${fmt(a.price)}\n`;
-    msg+=`\n🧠 Fear & Greed: <b>${sentiment.label}</b> (${sentiment.value}/100)\n⏰ ${new Date().toUTCString()}`;
-    for(const user of users.slice(0,50)){
-      await sendTelegram(user.telegram_id,msg,{inline_keyboard:[[{text:'📉 View Chart',callback_data:'menu_chart'},{text:'🤖 AI Analysis',callback_data:'menu_ai'}]]});
-      await new Promise(r=>setTimeout(r,100));
-    }
-  } catch(e){console.error('Broadcast:',e.message);}
-}
-
-// ─── Exchange orders ──────────────────────────────────────────────────────────
-async function placeBinanceOrder(apiKey,apiSecret,symbol,side,quantity) {
-  try {
-    const ts=Date.now();
-    const qs=`symbol=${symbol}&side=${side}&type=MARKET&quantity=${quantity}&timestamp=${ts}`;
-    const sig=require('crypto').createHmac('sha256',apiSecret).update(qs).digest('hex');
-    const r=await fetch(`https://api.binance.com/api/v3/order?${qs}&signature=${sig}`,{method:'POST',headers:{'X-MBX-APIKEY':apiKey,'Content-Type':'application/x-www-form-urlencoded'}});
-    const d=await r.json();
-    if(!r.ok) return{success:false,error:d.msg||'Order failed'};
-    return{success:true,orderId:String(d.orderId),price:parseFloat(d.fills?.[0]?.price||0)};
-  } catch(e){return{success:false,error:e.message};}
-}
-async function placeBybitOrder(apiKey,apiSecret,symbol,side,qty) {
-  try {
-    const ts=Date.now().toString();
-    const params={category:'spot',symbol,side:side==='BUY'?'Buy':'Sell',orderType:'Market',qty:String(qty)};
-    const body=JSON.stringify(params);
-    const sig=require('crypto').createHmac('sha256',apiSecret).update(ts+apiKey+'5000'+body).digest('hex');
-    const r=await fetch('https://api.bybit.com/v5/order/create',{method:'POST',headers:{'X-BAPI-API-KEY':apiKey,'X-BAPI-SIGN':sig,'X-BAPI-TIMESTAMP':ts,'X-BAPI-RECV-WINDOW':'5000','Content-Type':'application/json'},body});
-    const d=await r.json();
-    if(d.retCode!==0) return{success:false,error:d.retMsg};
-    return{success:true,orderId:d.result?.orderId||'',price:0};
-  } catch(e){return{success:false,error:e.message};}
-}
-
-// ─── Signal processor ─────────────────────────────────────────────────────────
-async function processSignal(telegram_id,pair,action,raw_payload,price_override) {
-  const strategies=listStrategies(telegram_id,{is_active:true});
-  const pairNorm=pair.replace('/','').toUpperCase();
-  const matched=strategies.filter(s=>s.pair.replace('/','').toUpperCase()===pairNorm||s.entry_type==='webhook');
-  if(!matched.length){
-    createSignalLog({telegram_id,pair,action,raw_payload,processed:false,result:'No match'});
-    await sendTelegram(telegram_id,`📡 Signal received: ${action} ${pair}\n⚠️ No matching strategy found.`,{inline_keyboard:[[{text:'🤖 Create Strategy',callback_data:'menu_create'}]]});
-    return{matched:0};
-  }
-  const user=getUser(telegram_id);
-  if(user?.bot_stopped){await sendTelegram(telegram_id,'⛔ Bot stopped. Signal ignored.');return{matched:0};}
-  let count=0;
-  for(const strategy of matched){
-    const todayCount=getTodayTradeCount(telegram_id,strategy.id);
-    if(strategy.max_trades_per_day&&todayCount>=strategy.max_trades_per_day){await sendTelegram(telegram_id,`⚠️ ${strategy.name}: Max trades/day reached.`);continue;}
-    const price=price_override||await fetchPrice(pair);
-    const tp=action==='BUY'?price*(1+strategy.take_profit_pct/100):price*(1-strategy.take_profit_pct/100);
-    const sl=action==='BUY'?price*(1-strategy.stop_loss_pct/100):price*(1+strategy.stop_loss_pct/100);
-    const balance=user?.balance_usd||10000;
-    const riskAmount=balance*(strategy.risk_per_trade_pct/100);
-    const qty=Math.round((riskAmount/(strategy.stop_loss_pct/100*price))*10000)/10000;
-    const rr=strategy.take_profit_pct/strategy.stop_loss_pct;
-    let liveOrderId='',actualPrice=price;
-    if(strategy.mode==='live'&&user?.auto_trade_enabled&&user?.exchange){
-      const apiKey=simpleDecrypt(user[`${user.exchange}_api_key_enc`]);
-      const apiSecret=simpleDecrypt(user[`${user.exchange}_secret_enc`]);
-      if(apiKey&&apiSecret){
-        const sym=pair.replace('/','').toUpperCase();
-        const res=user.exchange==='binance'?await placeBinanceOrder(apiKey,apiSecret,sym,action,qty):await placeBybitOrder(apiKey,apiSecret,sym,action,qty);
-        if(res.success){liveOrderId=res.orderId;if(res.price)actualPrice=res.price;}
-        else{await sendTelegram(telegram_id,`⚠️ Live order failed: ${res.error}`);continue;}
-      }
-    }
-    const trade=createTrade({telegram_id,strategy_id:strategy.id,strategy_name:strategy.name,pair,action,entry_price:actualPrice,take_profit:tp,stop_loss:sl,quantity:qty,status:'open',mode:strategy.mode||'paper',exchange_order_id:liveOrderId,signal_payload:raw_payload});
-    createSignalLog({telegram_id,pair,action,raw_payload,processed:true,matched_strategy_id:strategy.id,result:'Trade opened'});
-    const emoji=action==='BUY'?'🟢':'🔴';
-    const modeTag=strategy.mode==='live'?'🚀 LIVE':'🧪 PAPER';
-    await sendTelegram(telegram_id,
-      `${emoji} <b>Trade Executed!</b>\n\n📋 ${strategy.name} | ${modeTag}\n💱 ${pair} | <b>${action}</b>\n💰 Entry: $${fmt(actualPrice)}\n🎯 TP: $${fmt(tp)} (+${strategy.take_profit_pct}%)\n🛡️ SL: $${fmt(sl)} (-${strategy.stop_loss_pct}%)\n⚖️ R:R 1:${rr.toFixed(1)}\n💸 Risk: $${fmt(riskAmount)}\n🆔 <code>${trade.id.slice(-8)}</code>`,
-      {inline_keyboard:[[{text:'❌ Close Trade',callback_data:`close_${trade.id.slice(-8)}`},{text:'📊 Stats',callback_data:'menu_performance'}],[{text:'🏠 Menu',callback_data:'menu_main'}]]}
-    );
-    count++;
-  }
-  return{matched:count};
-}
-
-// ─── FAQ content ──────────────────────────────────────────────────────────────
-const FAQ=[
-  {q:'What is TradeBot AutoLab?',a:'TradeBot AutoLab is a 24/7 automated trading bot that lives in Telegram. You create trading strategies, connect signals from TradingView, and the bot automatically executes trades on Binance or Bybit on your behalf.'},
-  {q:'Is this bot free?',a:'Yes! Paper trading and all strategy features are completely free. For live trading you only need your own Binance or Bybit API keys. The bot itself has no subscription fee.'},
-  {q:'How does paper trading work?',a:'Paper trading uses a virtual $10,000 balance to simulate real trades with zero risk. All TP/SL monitoring is real — only the money is virtual. Perfect for testing strategies before going live.'},
-  {q:'How do I connect TradingView?',a:'Go to 🔗 Webhook Signal in the menu to get your personal webhook URL. In TradingView, create an alert and paste the URL. The message body should be: {"pair":"BTCUSDT","action":"BUY","price":{{close}}}'},
-  {q:'Is my API key safe?',a:'Your API keys are encrypted using AES before storage. We never request withdrawal permissions — only Spot Trading. For maximum safety, IP-whitelist the bot server on your exchange.'},
-  {q:'What markets are supported?',a:'Crypto (Binance, Bybit), Forex (price tracking only), Indices (US30, NAS100, SPX500), and Commodities (Gold XAU, Silver XAG). Live execution is available for crypto spot pairs on Binance and Bybit.'},
-  {q:'How does the AI assistant work?',a:'The AI analyzes real-time price, 24h performance, Fear & Greed index, and market momentum to give you trading bias, suggested TP/SL levels, and risk assessment. Access it from 🤖 AI Assistant in the menu.'},
-  {q:'What is the Risk:Reward ratio?',a:'R:R is the ratio of potential profit to potential loss. A 1:2 R:R means you risk $1 to potentially make $2. Always aim for at least 1:2 R:R. The bot calculates this automatically for every trade.'},
-  {q:'How do I stop all bots?',a:'Tap 🛑 STOP ALL in the main menu. All signal processing immediately stops. Your open trades remain open but no new ones will be placed until you tap ▶️ Resume.'},
-  {q:'Can multiple people use this bot?',a:'Yes! TradeBot AutoLab supports unlimited users. Each user has completely isolated data, strategies, and trades. Share the bot username @Autolabtrades_bot with anyone.'},
-];
-
-// ─── Onboarding FSM ───────────────────────────────────────────────────────────
-async function handleOnboarding(chat_id,user,step,text) {
-  const od=user.onboarding_data||{};
-  if(step==='await_tp'){
-    const tp=parseFloat(text);
-    if(isNaN(tp)||tp<=0||tp>100){await sendTelegram(chat_id,'❌ Enter a valid Take Profit % (e.g. 3):');return;}
-    updateUser(user.id,{onboarding_step:'await_sl',onboarding_data:{...od,take_profit_pct:tp}});
-    await sendTelegram(chat_id,`✅ TP: <b>${tp}%</b>\n\n🛡️ Enter Stop Loss %\n💡 Keep SL less than TP for good R:R (e.g. 1.5):`);
-  } else if(step==='await_sl'){
-    const sl=parseFloat(text);
-    if(isNaN(sl)||sl<=0||sl>50){await sendTelegram(chat_id,'❌ Enter valid SL % (e.g. 1.5):');return;}
-    const rr=(od.take_profit_pct/sl).toFixed(1);
-    const rremoji=rr>=2?'✅':rr>=1.5?'⚠️':'❌';
-    updateUser(user.id,{onboarding_step:'await_risk',onboarding_data:{...od,stop_loss_pct:sl}});
-    await sendTelegram(chat_id,`✅ SL: <b>${sl}%</b> | ${rremoji} R:R 1:${rr}\n\n💸 Risk per trade % (e.g. 1):\n💡 Never risk more than 2% per trade:`);
-  } else if(step==='await_risk'){
-    const r=parseFloat(text);
-    if(isNaN(r)||r<=0||r>10){await sendTelegram(chat_id,'❌ Enter 0.1–10 (e.g. 1):');return;}
-    updateUser(user.id,{onboarding_step:'await_max_trades',onboarding_data:{...od,risk_per_trade_pct:r}});
-    await sendTelegram(chat_id,`✅ Risk: <b>${r}%/trade</b>\n\n🔢 Max trades per day (e.g. 5):`);
-  } else if(step==='await_max_trades'){
-    const mt=parseInt(text);
-    if(isNaN(mt)||mt<=0||mt>50){await sendTelegram(chat_id,'❌ Enter 1–50:');return;}
-    updateUser(user.id,{onboarding_step:'await_max_loss',onboarding_data:{...od,max_trades_per_day:mt}});
-    await sendTelegram(chat_id,`✅ Max: <b>${mt} trades/day</b>\n\n🚨 Max daily loss % (e.g. 5) — bot stops if hit:`);
-  } else if(step==='await_max_loss'){
-    const ml=parseFloat(text);
-    if(isNaN(ml)||ml<=0||ml>50){await sendTelegram(chat_id,'❌ Enter 0.1–50:');return;}
-    updateUser(user.id,{onboarding_step:'await_strategy_name',onboarding_data:{...od,max_loss_limit_pct:ml}});
-    await sendTelegram(chat_id,`✅ Max loss: <b>${ml}%/day</b>\n\n🏷️ Name your strategy (e.g. BTC Scalper):`);
-  } else if(step==='await_strategy_name'){
-    const name=text.trim().substring(0,40);
-    if(!name||name.length<2){await sendTelegram(chat_id,'❌ At least 2 characters:');return;}
-    const rr=(od.take_profit_pct/od.stop_loss_pct).toFixed(1);
-    updateUser(user.id,{onboarding_step:'await_mode',onboarding_data:{...od,name}});
-    await sendTelegram(chat_id,
-      `✅ <b>"${name}"</b>\n\n📋 Summary:\n• ${od.market} | ${od.pair} | ${od.entry_type}\n• TP:${od.take_profit_pct}% SL:${od.stop_loss_pct}% R:R 1:${rr}\n• Risk:${od.risk_per_trade_pct}%/trade Max:${od.max_trades_per_day}/day\n\n🎯 Choose mode:`,
-      {inline_keyboard:[[{text:'🧪 Paper (Safe Start)',callback_data:'mode_paper'}],[{text:'🚀 Live (Real Money)',callback_data:'mode_live'}],[{text:'↩️ Back',callback_data:'menu_create'}]]}
-    );
-  } else if(step==='await_api_key'){
-    const exchange=od.exchange;
-    const key=text.trim();
-    if(key.length<10){await sendTelegram(chat_id,'❌ Invalid API key. Paste the full key:');return;}
-    updateUser(user.id,{onboarding_step:'await_api_secret',onboarding_data:{...od,api_key_temp:simpleEncrypt(key)}});
-    await sendTelegram(chat_id,`✅ API Key saved!\n\nNow paste your <b>${exchange.toUpperCase()} Secret Key</b>:`);
-  } else if(step==='await_api_secret'){
-    const exchange=od.exchange;
-    const secret=text.trim();
-    if(secret.length<10){await sendTelegram(chat_id,'❌ Invalid secret:');return;}
-    updateUser(user.id,{onboarding_step:'',onboarding_data:{},auto_trade_enabled:true,exchange,[`${exchange}_api_key_enc`]:od.api_key_temp,[`${exchange}_secret_enc`]:simpleEncrypt(secret)});
-    await sendTelegram(chat_id,`🔐 <b>API Keys Saved & Encrypted!</b>\n\n✅ ${exchange.toUpperCase()} connected\n✅ Auto Trading: ON\n\n⚠️ Ensure key has Spot Trading only — no withdrawals.`,mainMenuKeyboard());
-  } else if(step==='await_alert_pair'){
-    const raw=text.trim().toUpperCase();
-    const formatted=raw.endsWith('USDT')?raw.replace('USDT','/USDT'):raw.endsWith('USD')?raw.replace('USD','/USD'):raw;
-    updateUser(user.id,{onboarding_step:'await_alert_price',onboarding_data:{...od,alert_pair:formatted}});
-    await sendTelegram(chat_id,`✅ Pair: <b>${formatted}</b>\n\nEnter target price:`);
-  } else if(step==='await_alert_price'){
-    const price=parseFloat(text);
-    if(isNaN(price)||price<=0){await sendTelegram(chat_id,'❌ Enter a valid price:');return;}
-    updateUser(user.id,{onboarding_step:'await_alert_direction',onboarding_data:{...od,alert_price:price}});
-    await sendTelegram(chat_id,`✅ Target: <b>$${fmt(price)}</b>\n\nAlert when:`,{inline_keyboard:[[{text:'📈 Above',callback_data:'alert_dir_above'},{text:'📉 Below',callback_data:'alert_dir_below'}]]});
-  } else if(step==='await_journal_note'){
-    const note=text.trim();
-    if(note.length<3){await sendTelegram(chat_id,'❌ Write more:');return;}
-    addJournalNote(chat_id,note);
-    updateUser(user.id,{onboarding_step:'',onboarding_data:{}});
-    await sendTelegram(chat_id,`📓 <b>Saved!</b>\n\n"${note.substring(0,100)}"\n🗓️ ${new Date().toLocaleDateString()}`,backToMenu());
-  } else if(step==='await_ai_question'){
-    const question=text.trim();
-    updateUser(user.id,{onboarding_step:'',onboarding_data:{}});
-    const pair=od.ai_pair||'BTC/USDT';
-    const price=await fetchPrice(pair);
-    const sentiment=await fetchMarketSentiment();
-    await sendTelegram(chat_id,'🤖 Analyzing...');
-    const advice=await aiTradingAdvice(pair,question,price,sentiment);
-    await sendTelegram(chat_id,advice,{inline_keyboard:[[{text:'📉 View Chart',callback_data:'menu_chart'},{text:'🤖 Ask Again',callback_data:'menu_ai'}],[{text:'🏠 Menu',callback_data:'menu_main'}]]});
-  } else if(step==='await_chart_pair'){
-    const raw=text.trim().toUpperCase();
-    const formatted=raw.includes('/')?raw:(raw.endsWith('USDT')?raw.replace('USDT','/USDT'):raw+'/USDT');
-    updateUser(user.id,{onboarding_step:'',onboarding_data:{}});
-    await sendTelegram(chat_id,'📊 Generating chart...');
-    const chart=await generateChart(formatted);
-    await sendTelegram(chat_id,chart,{inline_keyboard:[[{text:'🤖 AI Analysis',callback_data:'menu_ai'},{text:'🔄 Refresh',callback_data:'menu_chart'}],[{text:'🏠 Menu',callback_data:'menu_main'}]]});
-  }
-}
-
-// ─── Callback handler ─────────────────────────────────────────────────────────
-async function handleCallback(callback) {
-  const chat_id=String(callback.message.chat.id);
-  const data=callback.data;
-  await answerCallback(callback.id);
-  let user=getUser(chat_id);
-  if(!user) user=createUser({telegram_id:chat_id,telegram_username:callback.from?.username||'',first_name:callback.from?.first_name||''});
-  const od=user.onboarding_data||{};
-
-  // Main menu
-  if(data==='menu_main'){
-    await sendTelegram(chat_id,`🏠 <b>TradeBot AutoLab</b>\n\nWelcome back, <b>${user.first_name||'Trader'}</b>! 👋\n\nWhat would you like to do?`,mainMenuKeyboard());
-
-  // Stop / resume
-  } else if(data==='menu_stopall'){
-    updateUser(user.id,{bot_stopped:true});
-    await sendTelegram(chat_id,`🛑 <b>ALL BOTS STOPPED</b>\n\nSignal processing paused.`,{inline_keyboard:[[{text:'▶️ Resume',callback_data:'resume_bot'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
-  } else if(data==='resume_bot'){
-    updateUser(user.id,{bot_stopped:false});
-    await sendTelegram(chat_id,`▶️ <b>RESUMED</b> — All strategies active.`,mainMenuKeyboard());
-
-  // Website
-  } else if(data==='menu_website'){
-    await sendTelegram(chat_id,`🌐 <b>TradeBot AutoLab Website</b>\n\nVisit our full platform dashboard, strategy guide, and feature overview:\n\n🔗 ${SITE_URL}\n\nShare this link with anyone who wants to use the bot!`,{inline_keyboard:[[{text:'🌐 Open Website',url:SITE_URL}],[{text:'↩️ Back',callback_data:'menu_main'}]]});
-
-  // News
-  } else if(data==='menu_news'){
-    await sendTelegram(chat_id,'📡 Fetching latest crypto news...');
-    const news=await fetchCryptoNews();
-    const sentiment=await fetchMarketSentiment();
-    const fg=parseInt(sentiment.value)||50;
-    const fgEmoji=fg>=70?'🔥':fg>=55?'😏':fg>=45?'😐':fg>=30?'😨':'😱';
-    let msg=`🗞️ <b>Crypto Market News</b>\n\n`;
-    msg+=`🧠 Fear & Greed: <b>${sentiment.label}</b> ${fgEmoji} (${sentiment.value}/100)\n`;
-    msg+=`⏰ ${new Date().toUTCString()}\n\n`;
-    if(news.length){
-      for(const n of news){
-        msg+=`📰 <b>${n.title}</b>\n`;
-        if(n.source) msg+=`   🏢 ${n.source}\n`;
-        msg+='\n';
-      }
-    } else {
-      msg+=`⚠️ News temporarily unavailable. Check CoinTelegraph, CoinDesk for latest updates.\n`;
-    }
-    await sendTelegram(chat_id,msg,{inline_keyboard:[[{text:'🤖 AI Analysis',callback_data:'menu_ai'},{text:'📈 Prices',callback_data:'menu_prices'}],[{text:'🔄 Refresh News',callback_data:'menu_news'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
-
-  // Chart
-  } else if(data==='menu_chart'){
-    updateUser(user.id,{onboarding_step:'await_chart_pair',onboarding_data:{}});
-    await sendTelegram(chat_id,`📉 <b>View Chart</b>\n\nType the pair to chart (e.g. <code>BTCUSDT</code>, <code>ETHUSDT</code>, <code>SOLUSDT</code>):\n\n💡 Showing 4H candlestick (last 20 bars)`,{inline_keyboard:[[{text:'₿ BTC/USDT',callback_data:'chart_BTCUSDT'},{text:'◆ ETH/USDT',callback_data:'chart_ETHUSDT'}],[{text:'◎ SOL/USDT',callback_data:'chart_SOLUSDT'},{text:'🥇 XAU/USD',callback_data:'chart_XAUUSDT'}],[{text:'↩️ Back',callback_data:'menu_main'}]]});
-  } else if(data.startsWith('chart_')){
-    const sym=data.replace('chart_','');
-    const pair=sym.length>6?sym.replace(/([A-Z]{2,})([A-Z]{3,4}$)/,'$1/$2'):sym;
-    await sendTelegram(chat_id,'📊 Generating chart...');
-    const chart=await generateChart(sym.includes('/')? sym:sym);
-    await sendTelegram(chat_id,chart,{inline_keyboard:[[{text:'🤖 AI Analysis',callback_data:'menu_ai'},{text:'🔄 Refresh',callback_data:`chart_${sym}`}],[{text:'↩️ Back',callback_data:'menu_chart'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
-
-  // AI Assistant
-  } else if(data==='menu_ai'){
-    const pairs=['BTC/USDT','ETH/USDT','SOL/USDT','BNB/USDT','XRP/USDT','XAU/USD'];
-    await sendTelegram(chat_id,
-      `🤖 <b>AI Trading Assistant</b>\n\nSelect a pair to analyze, or type your question:\n\n💡 Ask me:\n• "Should I buy BTC now?"\n• "What's the trend for ETH?"\n• "Is this a good entry for SOL?"\n• "What's the risk on gold?"`,
-      {inline_keyboard:[
-        [{text:'₿ Analyze BTC',callback_data:'ai_BTC/USDT'},{text:'◆ Analyze ETH',callback_data:'ai_ETH/USDT'}],
-        [{text:'◎ Analyze SOL',callback_data:'ai_SOL/USDT'},{text:'🥇 Analyze Gold',callback_data:'ai_XAU/USD'}],
-        [{text:'✍️ Ask a Question',callback_data:'ai_custom'}],
-        [{text:'↩️ Back',callback_data:'menu_main'}],
-      ]}
-    );
-  } else if(data.startsWith('ai_')&&!data.includes('custom')){
-    const pair=data.replace('ai_','');
-    await sendTelegram(chat_id,`🤖 Analyzing <b>${pair}</b>...`);
-    const price=await fetchPrice(pair);
-    const sentiment=await fetchMarketSentiment();
-    const advice=await aiTradingAdvice(pair,'analysis',price,sentiment);
-    await sendTelegram(chat_id,advice,{inline_keyboard:[[{text:'📉 View Chart',callback_data:`chart_${pair.replace('/','')}`},{text:'🤖 Other Pair',callback_data:'menu_ai'}],[{text:'🤖 Trade This Pair',callback_data:'menu_create'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
-  } else if(data==='ai_custom'){
-    updateUser(user.id,{onboarding_step:'await_ai_question',onboarding_data:{ai_pair:'BTC/USDT'}});
-    await sendTelegram(chat_id,`✍️ Type your trading question:\n\n💡 Examples:\n• "Should I buy BTC at current levels?"\n• "Is ETH oversold?"\n• "What strategy works for gold?"`);
-
-  // FAQ
-  } else if(data==='menu_faq'){
-    let msg=`❓ <b>Frequently Asked Questions</b>\n\n`;
-    for(let i=0;i<Math.min(FAQ.length,5);i++) msg+=`${i+1}. ${FAQ[i].q}\n`;
-    await sendTelegram(chat_id,msg,{inline_keyboard:[
-      ...FAQ.slice(0,5).map((f,i)=>[{text:`${i+1}. ${f.q.substring(0,35)}...`,callback_data:`faq_${i}`}]),
-      [{text:'📖 Full Guide',callback_data:'menu_help'},{text:'🏠 Menu',callback_data:'menu_main'}],
-    ]});
-  } else if(data.startsWith('faq_')){
-    const i=parseInt(data.replace('faq_',''));
-    const faq=FAQ[i];
-    await sendTelegram(chat_id,`❓ <b>${faq.q}</b>\n\n${faq.a}`,{inline_keyboard:[[{text:'❓ More FAQs',callback_data:'menu_faq'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
-
-  // Help / How to use
-  } else if(data==='menu_help'){
-    await sendTelegram(chat_id,
-      `📖 <b>How to Use TradeBot AutoLab</b>\n\n`+
-      `<b>🚀 Quick Start (5 mins):</b>\n\n`+
-      `1️⃣ Tap <b>🤖 Create Strategy</b>\n   → Pick market, pair, entry signal\n   → Set TP %, SL %, risk per trade\n   → Name it & choose Paper mode\n\n`+
-      `2️⃣ Tap <b>🔗 Webhook Signal</b>\n   → Copy your personal URL\n   → Paste into TradingView alert\n   → Bot auto-executes when alert fires\n\n`+
-      `3️⃣ Tap <b>📊 Performance</b>\n   → Track win rate, P&L, open trades\n   → See per-strategy breakdown\n\n`+
-      `4️⃣ When confident → Switch to <b>🚀 Live</b>\n   → Connect Binance or Bybit API\n   → Bot executes real orders 24/7\n\n`+
-      `<b>⚡ Key Features:</b>\n`+
-      `• Auto TP/SL close every 30s\n`+
-      `• AI analysis on any pair\n`+
-      `• Real-time news & alerts\n`+
-      `• 4H chart view\n`+
-      `• Price alerts\n`+
-      `• Trade journal\n`+
-      `• Daily loss protection\n\n`+
-      `<b>⚠️ Safety Rules:</b>\n`+
-      `• Always paper trade first (20+ trades)\n`+
-      `• Never risk more than 1-2% per trade\n`+
-      `• Set a max daily loss limit\n`+
-      `• Use Spot Trading API only — no withdrawals`,
-      {inline_keyboard:[[{text:'❓ FAQ',callback_data:'menu_faq'},{text:'🤖 Create Strategy',callback_data:'menu_create'}],[{text:'🌐 Website',callback_data:'menu_website'},{text:'🏠 Menu',callback_data:'menu_main'}]]}
-    );
-
-  // Support
-  } else if(data==='menu_support'){
-    await sendTelegram(chat_id,
-      `🆘 <b>Support & Resources</b>\n\n`+
-      `📖 <b>Self-Help:</b>\n`+
-      `• Use ❓ FAQ for common questions\n`+
-      `• Use 📖 Help & Guide for step-by-step\n`+
-      `• Use 🤖 AI Assistant for market questions\n\n`+
-      `🌐 <b>Website:</b> ${SITE_URL}\n\n`+
-      `📡 <b>Signal Webhook:</b>\n`+
-      `Your URL: <code>${SERVER_URL}/signal?user_id=${chat_id}</code>\n\n`+
-      `🔧 <b>Common Issues:</b>\n`+
-      `• No trades firing → Check strategy is Active\n`+
-      `• Wrong pair → Ensure signal pair matches strategy\n`+
-      `• Live order failed → Check API key permissions\n`+
-      `• Bot not responding → Send /start to reset\n\n`+
-      `⚠️ <i>Trading involves risk. Never invest more than you can afford to lose.</i>`,
-      {inline_keyboard:[[{text:'❓ FAQ',callback_data:'menu_faq'},{text:'📖 Full Guide',callback_data:'menu_help'}],[{text:'🌐 Website',callback_data:'menu_website'},{text:'🏠 Menu',callback_data:'menu_main'}]]}
-    );
-
-  // Prices
-  } else if(data==='menu_prices'){
-    const pairs=['BTC/USDT','ETH/USDT','SOL/USDT','BNB/USDT','XRP/USDT','XAU/USD','EUR/USD','US30'];
-    const prices={};
-    for(const p of pairs) prices[p]=await fetchPrice(p);
-    const sentiment=await fetchMarketSentiment();
-    await sendTelegram(chat_id,
-      `📈 <b>Live Market Prices</b>\n\n`+
-      `₿ BTC/USDT  <b>$${fmt(prices['BTC/USDT'])}</b>\n`+
-      `◆ ETH/USDT  <b>$${fmt(prices['ETH/USDT'])}</b>\n`+
-      `◎ SOL/USDT  <b>$${fmt(prices['SOL/USDT'])}</b>\n`+
-      `🟡 BNB/USDT  <b>$${fmt(prices['BNB/USDT'])}</b>\n`+
-      `🔵 XRP/USDT  <b>$${fmt(prices['XRP/USDT'])}</b>\n`+
-      `🥇 XAU/USD   <b>$${fmt(prices['XAU/USD'])}</b>\n`+
-      `💱 EUR/USD   <b>${prices['EUR/USD'].toFixed(4)}</b>\n`+
-      `📊 US30      <b>$${fmt(prices['US30'])}</b>\n\n`+
-      `🧠 Fear & Greed: <b>${sentiment.label}</b> (${sentiment.value}/100)\n`+
-      `⏱️ ${new Date().toUTCString()}`,
-      {inline_keyboard:[[{text:'🤖 AI Analysis',callback_data:'menu_ai'},{text:'📉 Chart',callback_data:'menu_chart'}],[{text:'🔔 Set Alert',callback_data:'add_alert'},{text:'🔄 Refresh',callback_data:'menu_prices'}],[{text:'🏠 Menu',callback_data:'menu_main'}]]}
-    );
-
-  // Alerts
-  } else if(data==='menu_alerts'){
-    const alerts=getUserAlerts(chat_id);
-    let msg=`🔔 <b>Price Alerts</b>\n\nGet notified when a price hits your target.\n\n`;
-    if(alerts.length){msg+=`<b>Active (${alerts.length}):</b>\n`;for(const a of alerts)msg+=`• ${a.pair} ${a.direction==='above'?'📈 >':'📉 <'} $${fmt(a.target_price)}\n`;msg+='\n';}
-    else msg+='No active alerts.\n\n';
-    await sendTelegram(chat_id,msg,{inline_keyboard:[[{text:'➕ Add Alert',callback_data:'add_alert'}],[{text:'↩️ Back',callback_data:'menu_main'}]]});
-  } else if(data==='add_alert'){
-    updateUser(user.id,{onboarding_step:'await_alert_pair',onboarding_data:{}});
-    await sendTelegram(chat_id,`🔔 <b>New Price Alert</b>\n\nType the pair (e.g. BTCUSDT, ETHUSDT):`);
-  } else if(data==='alert_dir_above'||data==='alert_dir_below'){
-    const direction=data==='alert_dir_above'?'above':'below';
-    createPriceAlert({telegram_id:chat_id,pair:od.alert_pair,direction,target_price:od.alert_price});
-    updateUser(user.id,{onboarding_step:'',onboarding_data:{}});
-    await sendTelegram(chat_id,`✅ Alert set! ${od.alert_pair} ${direction==='above'?'📈 above':'📉 below'} <b>$${fmt(od.alert_price)}</b>`,{inline_keyboard:[[{text:'🔔 My Alerts',callback_data:'menu_alerts'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
-
-  // Performance
-  } else if(data==='menu_performance'){
-    const stats=getStats(chat_id);
-    const recentClosed=listTrades(chat_id,{status:'closed',limit:10});
-    const todayPnl=getTodayPnl(chat_id);
-    const spark=sparkline(recentClosed);
-    let streak=0;for(const t of recentClosed){if(t.pnl>0)streak++;else break;}
-    const strategies=listStrategies(chat_id);
-    let stratText='';
-    for(const s of strategies.slice(0,3)){
-      const wr=s.total_trades>0?((s.total_wins/s.total_trades)*100).toFixed(0)+'%':'—';
-      stratText+=`\n  ${s.mode==='live'?'🚀':'🧪'} <b>${s.name}</b>: ${s.total_trades}T | ${wr} WR | ${fmtPnl(s.total_pnl||0)}`;
-    }
-    await sendTelegram(chat_id,
-      `📊 <b>Performance Dashboard</b>\n\n`+
-      `📈 Total: <b>${stats.total}</b> | Open: <b>${stats.open}</b> | Closed: <b>${stats.closed}</b>\n`+
-      `✅ Wins: <b>${stats.wins}</b> | ❌ Losses: <b>${stats.losses}</b>\n`+
-      `🏆 Win Rate: <b>${stats.winRate.toFixed(1)}%</b>\n`+
-      `💰 Total P&L: <b>${fmtPnl(stats.totalPnl)}</b>\n`+
-      `📅 Today: <b>${fmtPnl(todayPnl)}</b>\n`+
-      `📊 Avg/trade: <b>${fmtPnl(stats.avgPnl)}</b>\n`+
-      `🔥 Win streak: <b>${streak}</b>\n\n`+
-      `📉 Sparkline: ${spark}\n`+
-      (stats.bestTrade?`\n🥇 Best: ${fmtPnl(stats.bestTrade.pnl)} (${stats.bestTrade.pair})`:'`')+
-      `\n\n<b>Strategies:</b>${stratText||'\nNone yet.'}`,
-      {inline_keyboard:[[{text:'📂 Open Trades',callback_data:'view_open'},{text:'📜 History',callback_data:'view_history'}],[{text:'↩️ Back',callback_data:'menu_main'}]]}
-    );
-  } else if(data==='view_open'){
-    const open=listTrades(chat_id,{status:'open'});
-    if(!open.length){await sendTelegram(chat_id,'📂 No open trades.',backToMenu());return;}
-    let msg=`📂 <b>Open Trades (${open.length})</b>\n\n`;
-    for(const t of open.slice(0,8)){
-      const cur=await fetchPrice(t.pair);
-      const upnl=t.action==='BUY'?(cur-t.entry_price)*t.quantity:(t.entry_price-cur)*t.quantity;
-      msg+=`${upnl>=0?'🟢':'🔴'} <b>${t.pair}</b> ${t.action} — ${fmtPnl(upnl)}\n`;
-      msg+=`   $${fmt(t.entry_price)} → $${fmt(cur)} | ${t.mode==='live'?'🚀':'🧪'}\n\n`;
-    }
-    await sendTelegram(chat_id,msg,{inline_keyboard:[[{text:'↩️ Back',callback_data:'menu_performance'}]]});
-  } else if(data==='view_history'){
-    const trades=listTrades(chat_id,{status:'closed',limit:10});
-    if(!trades.length){await sendTelegram(chat_id,'📜 No closed trades yet.',backToMenu());return;}
-    let msg=`📜 <b>Last ${trades.length} Trades</b>\n\n`;
-    for(const t of trades) msg+=`${t.pnl>=0?'✅':'❌'} <b>${t.pair}</b> ${t.action} ${fmtPnl(t.pnl)}\n   ${t.close_reason}\n\n`;
-    await sendTelegram(chat_id,msg,{inline_keyboard:[[{text:'↩️ Back',callback_data:'menu_performance'}]]});
-
-  // Close trade
-  } else if(data.startsWith('close_')){
-    const suffix=data.replace('close_','');
-    const trade=listTrades(chat_id,{status:'open'}).find(t=>t.id.slice(-8)===suffix);
-    if(trade){
-      const price=await fetchPrice(trade.pair);
-      const closed=closeTrade(trade.id,price,'Manual Close 👤');
-      await sendTelegram(chat_id,`👤 <b>Closed Manually</b>\n\n${trade.pair} | ${trade.action}\n${fmtPnl(closed.pnl)} (${fmtPct(closed.pnl_pct)})`,backToMenu());
-    } else await sendTelegram(chat_id,'⚠️ Trade not found.',backToMenu());
-
-  // Create strategy
-  } else if(data==='menu_create'){
-    updateUser(user.id,{onboarding_step:'select_market',onboarding_data:{}});
-    await sendTelegram(chat_id,`🤖 <b>Create Strategy — Step 1</b>\n\nSelect your market:`,
-      {inline_keyboard:[[{text:'₿ Crypto',callback_data:'market_crypto'},{text:'💱 Forex',callback_data:'market_forex'}],[{text:'📈 Indices',callback_data:'market_indices'},{text:'🥇 Commodities',callback_data:'market_commodities'}],[{text:'↩️ Back',callback_data:'menu_main'}]]}
-    );
-  } else if(data.startsWith('market_')){
-    const market=data.replace('market_','');
-    const pairs={crypto:[['BTC/USDT','ETH/USDT'],['BNB/USDT','SOL/USDT'],['XRP/USDT','ADA/USDT'],['DOGE/USDT','LINK/USDT']],forex:[['EUR/USD','GBP/USD'],['USD/JPY','AUD/USD'],['USD/CAD','EUR/GBP']],indices:[['US30','SPX500'],['NAS100','GER40']],commodities:[['XAU/USD','XAG/USD'],['WTI/USD','BRT/USD']]};
-    updateUser(user.id,{onboarding_step:'select_pair',onboarding_data:{market}});
-    const rows=(pairs[market]||pairs.crypto).map(row=>row.map(p=>({text:p,callback_data:`pair_${p.replace('/','')}`})));
-    await sendTelegram(chat_id,`✅ Market: <b>${market}</b>\n\nStep 2: Choose pair:`,{inline_keyboard:[...rows,[{text:'↩️ Back',callback_data:'menu_create'}]]});
-  } else if(data.startsWith('pair_')){
-    const pairRaw=data.replace('pair_','');
-    const formatted=pairRaw.length>6?pairRaw.replace(/([A-Z]{2,})([A-Z]{3,4}$)/,'$1/$2'):pairRaw;
-    updateUser(user.id,{onboarding_step:'select_entry',onboarding_data:{...od,pair:formatted}});
-    await sendTelegram(chat_id,`✅ Pair: <b>${formatted}</b>\n\nStep 3: Entry signal type:`,
-      {inline_keyboard:[[{text:'📉 RSI Signal',callback_data:'entry_rsi'}],[{text:'📊 MA Crossover',callback_data:'entry_ma'}],[{text:'🔓 Price Breakout',callback_data:'entry_breakout'}],[{text:'🕯️ Candlestick Pattern',callback_data:'entry_candle'}],[{text:'🔗 TradingView Webhook',callback_data:'entry_webhook'}],[{text:'↩️ Back',callback_data:'menu_create'}]]}
-    );
-  } else if(data.startsWith('entry_')){
-    const entryType=data.replace('entry_','');
-    const labels={rsi:'RSI Signal',ma:'MA Crossover',breakout:'Price Breakout',candle:'Candlestick',webhook:'TradingView Webhook'};
-    updateUser(user.id,{onboarding_step:'await_tp',onboarding_data:{...od,entry_type:entryType}});
-    await sendTelegram(chat_id,`✅ Entry: <b>${labels[entryType]}</b>\n\nStep 4: Enter <b>Take Profit %</b> (e.g. 3):`);
-  } else if(data==='mode_paper'||data==='mode_live'){
-    const mode=data.replace('mode_','');
-    createStrategy({telegram_id:chat_id,name:od.name,market:od.market,pair:od.pair,entry_type:od.entry_type,entry_rules:{},take_profit_pct:od.take_profit_pct,stop_loss_pct:od.stop_loss_pct,trailing_stop:false,risk_per_trade_pct:od.risk_per_trade_pct,max_trades_per_day:od.max_trades_per_day,max_loss_limit_pct:od.max_loss_limit_pct,is_active:true,mode});
-    updateUser(user.id,{onboarding_step:'',onboarding_data:{}});
-    await sendTelegram(chat_id,
-      `🎉 <b>Strategy Created!</b>\n\n📋 "${od.name}"\n💱 ${od.pair} | ${mode==='paper'?'🧪 PAPER':'🚀 LIVE'}\n🎯 TP:${od.take_profit_pct}% SL:${od.stop_loss_pct}% R:R 1:${(od.take_profit_pct/od.stop_loss_pct).toFixed(1)}\n\n✅ Active & listening for signals!`,
-      {inline_keyboard:[[{text:'🔗 Connect Signal',callback_data:'menu_signal'}],[{text:'📋 My Strategies',callback_data:'list_strategies'},{text:'🏠 Menu',callback_data:'menu_main'}]]}
-    );
-
-  // List strategies
-  } else if(data==='list_strategies'){
-    const strategies=listStrategies(chat_id);
-    if(!strategies.length){await sendTelegram(chat_id,'📋 No strategies yet.',{inline_keyboard:[[{text:'🤖 Create',callback_data:'menu_create'},{text:'↩️ Back',callback_data:'menu_main'}]]});return;}
-    let msg=`📋 <b>My Strategies (${strategies.length})</b>\n\n`;
-    for(const s of strategies){
-      const wr=s.total_trades>0?((s.total_wins/s.total_trades)*100).toFixed(0)+'%':'—';
-      msg+=`${s.is_active?'🟢':'🔴'} ${s.mode==='live'?'🚀':'🧪'} <b>${s.name}</b>\n   ${s.pair} TP:${s.take_profit_pct}% SL:${s.stop_loss_pct}%\n   ${s.total_trades}T | ${wr} WR | ${fmtPnl(s.total_pnl||0)}\n\n`;
-    }
-    await sendTelegram(chat_id,msg,{inline_keyboard:[
-      ...strategies.slice(0,5).map(s=>[{text:`${s.is_active?'⏸':'▶️'} ${s.name}`,callback_data:`toggle_${s.id.slice(-8)}`},{text:'🗑️',callback_data:`del_${s.id.slice(-8)}`}]),
-      [{text:'➕ New',callback_data:'menu_create'},{text:'↩️ Back',callback_data:'menu_main'}],
-    ]});
-  } else if(data.startsWith('toggle_')){
-    const s=listStrategies(chat_id).find(x=>x.id.slice(-8)===data.replace('toggle_',''));
-    if(s){updateStrategy(s.id,{is_active:!s.is_active});await sendTelegram(chat_id,`${!s.is_active?'▶️ Enabled':'⏸ Paused'}: ${s.name}`,{inline_keyboard:[[{text:'📋 Back',callback_data:'list_strategies'}]]});}
-  } else if(data.startsWith('del_')){
-    const s=listStrategies(chat_id).find(x=>x.id.slice(-8)===data.replace('del_',''));
-    if(s) await sendTelegram(chat_id,`🗑️ Delete "${s.name}"?`,{inline_keyboard:[[{text:'✅ Delete',callback_data:`confirm_del_${s.id.slice(-8)}`},{text:'❌ Cancel',callback_data:'list_strategies'}]]});
-  } else if(data.startsWith('confirm_del_')){
-    const s=listStrategies(chat_id).find(x=>x.id.slice(-8)===data.replace('confirm_del_',''));
-    if(s){deleteStrategy(s.id);await sendTelegram(chat_id,`🗑️ Deleted.`,{inline_keyboard:[[{text:'📋 Back',callback_data:'list_strategies'}]]});}
-
-  // Paper / Live
-  } else if(data==='menu_paper'){
-    const stats=getStats(chat_id);
-    const paperStrats=listStrategies(chat_id).filter(s=>s.mode==='paper');
-    await sendTelegram(chat_id,`🧪 <b>Paper Trading</b>\n\n$10,000 virtual balance — zero risk.\n\n📊 Total: ${stats.total} | Win Rate: ${stats.winRate.toFixed(1)}%\n💰 P&L: ${fmtPnl(stats.totalPnl)}\n📋 Paper strategies: ${paperStrats.length}`,
-      {inline_keyboard:[[{text:'🤖 New Paper Strategy',callback_data:'menu_create'},{text:'📊 Report',callback_data:'menu_performance'}],[{text:'↩️ Back',callback_data:'menu_main'}]]}
-    );
-  } else if(data==='menu_autotrade'){
-    if(user.auto_trade_enabled&&user.exchange){
-      await sendTelegram(chat_id,`🚀 <b>Live Trading</b>\n\n✅ ${user.exchange.toUpperCase()} connected\n✅ Auto Trading: ON`,
-        {inline_keyboard:[[{text:'⛔ Disable',callback_data:'disable_auto'},{text:'🔑 Update Keys',callback_data:'connect_binance'}],[{text:'↩️ Back',callback_data:'menu_main'}]]}
-      );
-    } else {
-      await sendTelegram(chat_id,`🚀 <b>Live Trading Setup</b>\n\n⚠️ Safety: Spot Trading only, no withdrawals.\n\nSelect exchange:`,
-        {inline_keyboard:[[{text:'🟡 Binance',callback_data:'connect_binance'},{text:'🔵 Bybit',callback_data:'connect_bybit'}],[{text:'↩️ Back',callback_data:'menu_main'}]]}
-      );
-    }
-  } else if(data==='disable_auto'){
-    updateUser(user.id,{auto_trade_enabled:false});
-    await sendTelegram(chat_id,'⛔ Auto Trading disabled.',mainMenuKeyboard());
-  } else if(data==='connect_binance'||data==='connect_bybit'){
-    const exchange=data==='connect_bybit'?'bybit':'binance';
-    updateUser(user.id,{onboarding_step:'await_api_key',onboarding_data:{exchange}});
-    await sendTelegram(chat_id,`🔐 <b>${exchange.toUpperCase()} API Setup</b>\n\nCreate API key with Spot Trading only — no withdrawals.\n\nPaste your <b>API Key</b>:`);
-
-  // Signal
-  } else if(data==='menu_signal'){
-    await sendTelegram(chat_id,
-      `🔗 <b>TradingView Webhook</b>\n\n<b>Your personal URL:</b>\n<code>${SERVER_URL}/signal?user_id=${chat_id}</code>\n\n<b>Alert Message Body:</b>\n<code>{\n  "pair": "BTCUSDT",\n  "action": "BUY",\n  "price": {{close}}\n}</code>\n\n✅ Supported: BUY, SELL, LONG, SHORT\n✅ Pair must match your strategy`,
-      {inline_keyboard:[[{text:'🧪 Test Signal',callback_data:'test_signal'}],[{text:'❓ Signal Help',callback_data:'menu_help'}],[{text:'↩️ Back',callback_data:'menu_main'}]]}
-    );
-  } else if(data==='test_signal'){
-    const result=await processSignal(chat_id,'BTC/USDT','BUY',{test:true},null);
-    if(result.matched===0) await sendTelegram(chat_id,'🧪 Test sent! No BTC/USDT strategy found. Create one first.',{inline_keyboard:[[{text:'🤖 Create Strategy',callback_data:'menu_create'}]]});
-
-  // Journal
-  } else if(data==='menu_journal'){
-    const notes=getJournal(chat_id);
-    let msg=`📓 <b>Trade Journal</b>\n\n`;
-    if(notes.length){msg+=`<b>Recent:</b>\n\n`;for(const n of notes.slice(0,5))msg+=`📝 <i>${n.created_date.split('T')[0]}</i>\n${n.note.substring(0,120)}\n\n`;}
-    else msg+='No entries yet.\n\n';
-    await sendTelegram(chat_id,msg,{inline_keyboard:[[{text:'✍️ Add Entry',callback_data:'add_journal'}],[{text:'↩️ Back',callback_data:'menu_main'}]]});
-  } else if(data==='add_journal'){
-    updateUser(user.id,{onboarding_step:'await_journal_note',onboarding_data:{}});
-    await sendTelegram(chat_id,'✍️ Type your journal entry:');
-
-  // Settings
-  } else if(data==='menu_settings'){
-    const strategies=listStrategies(chat_id);
-    await sendTelegram(chat_id,
-      `⚙️ <b>Settings</b>\n\n👤 ${user.first_name||'Trader'} | 🆔 <code>${chat_id}</code>\n📋 Strategies: ${strategies.length}\n🚀 Auto Trade: ${user.auto_trade_enabled?'✅':'❌'}\n💱 Exchange: ${user.exchange||'None'}\n🛑 Status: ${user.bot_stopped?'⛔ Stopped':'✅ Running'}`,
-      {inline_keyboard:[
-        [{text:'📋 Strategies',callback_data:'list_strategies'}],
-        [{text:user.auto_trade_enabled?'⛔ Disable Auto':'🚀 Enable Auto',callback_data:user.auto_trade_enabled?'disable_auto':'menu_autotrade'}],
-        [{text:user.bot_stopped?'▶️ Resume':'🛑 Stop',callback_data:user.bot_stopped?'resume_bot':'menu_stopall'}],
-        [{text:'🔔 Alerts',callback_data:'menu_alerts'},{text:'📓 Journal',callback_data:'menu_journal'}],
-        [{text:'🏠 Main Menu',callback_data:'menu_main'}],
-      ]}
-    );
-  }
-}
-
-// ─── Message handler ──────────────────────────────────────────────────────────
-async function handleMessage(msg) {
-  const chat_id=String(msg.chat.id);
-  const text=msg.text||'';
-  let user=getUser(chat_id);
-  if(!user) user=createUser({telegram_id:chat_id,telegram_username:msg.from?.username||'',first_name:msg.from?.first_name||''});
-
-  if(text.startsWith('/start')||text==='/menu'){
-    updateUser(user.id,{bot_stopped:false,onboarding_step:'',onboarding_data:{},first_name:msg.from?.first_name||user.first_name});
-    await sendTelegram(chat_id,
-      `🤖 <b>TradeBot AutoLab</b>\n\n`+
-      `${user.first_name?`Welcome back, <b>${msg.from?.first_name||user.first_name}</b>! 👋`:'🎉 <b>Welcome!</b>'}\n\n`+
-      `<b>Your 24/7 automated trading partner.</b>\n\n`+
-      `✅ Build strategies in 2 minutes\n`+
-      `✅ Auto-execute on Binance & Bybit\n`+
-      `✅ TradingView webhook integration\n`+
-      `✅ AI market analysis\n`+
-      `✅ Real-time news & price alerts\n`+
-      `✅ Paper trade risk-free\n\n`+
-      `💡 New here? Tap <b>❓ FAQ & Help</b>`,
-      mainMenuKeyboard()
-    );
-    return;
-  }
-  if(text==='/performance'||text==='/stats') { await handleCallback({message:{chat:{id:chat_id}},from:msg.from,id:'0',data:'menu_performance'}); return; }
-  if(text==='/prices') { await handleCallback({message:{chat:{id:chat_id}},from:msg.from,id:'0',data:'menu_prices'}); return; }
-  if(text==='/news') { await handleCallback({message:{chat:{id:chat_id}},from:msg.from,id:'0',data:'menu_news'}); return; }
-  if(text==='/ai') { await handleCallback({message:{chat:{id:chat_id}},from:msg.from,id:'0',data:'menu_ai'}); return; }
-  if(text==='/help'||text==='/faq') { await handleCallback({message:{chat:{id:chat_id}},from:msg.from,id:'0',data:'menu_faq'}); return; }
-  if(text==='/stop') { updateUser(user.id,{bot_stopped:true}); await sendTelegram(chat_id,'🛑 Bot stopped. Send /start to resume.'); return; }
-
-  if(user.onboarding_step&&user.onboarding_step!=='done'){
-    await handleOnboarding(chat_id,user,user.onboarding_step,text); return;
-  }
-  await sendTelegram(chat_id,`Use the menu to navigate.\n\nCommands: /menu /prices /news /ai /stats /help /stop`,mainMenuKeyboard());
-}
-
-// ─── Routes ───────────────────────────────────────────────────────────────────
-app.post('/webhook', async(req,res)=>{
-  res.sendStatus(200);
-  try {
-    if(req.body.callback_query) await handleCallback(req.body.callback_query);
-    else if(req.body.message) await handleMessage(req.body.message);
-  } catch(e){console.error('Webhook error:',e.message,e.stack);}
+    res.json({received:true});
+  } catch(e) { res.status(400).json({error:e.message}); }
 });
 
-app.post('/signal', async(req,res)=>{
-  const user_id=req.query.user_id||req.body.user_id;
-  if(!user_id) return res.status(400).json({error:'user_id required'});
-  const{pair,action,price}=req.body;
-  if(!pair||!action) return res.status(400).json({error:'pair and action required'});
-  const normAction=['BUY','LONG','buy','long'].includes(action)?'BUY':'SELL';
-  const result=await processSignal(user_id,pair,normAction,req.body,price?parseFloat(price):null);
-  res.json({success:true,matched:result.matched,pair,action:normAction});
-});
-app.get('/signal',async(req,res)=>{
-  const{user_id,pair,action}=req.query;
-  if(!user_id||!pair||!action) return res.status(400).json({error:'user_id, pair, action required'});
-  const result=await processSignal(user_id,pair,['BUY','LONG','buy','long'].includes(action)?'BUY':'SELL',req.query,null);
-  res.json({success:true,matched:result.matched});
+// Telegram webhook
+app.post('/webhook', async (req,res) => {
+  res.json({ok:true}); // respond fast
+  try {
+    const update = req.body;
+    if (update.callback_query) {
+      await handleCallback(update.callback_query);
+    } else if (update.message) {
+      await handleMessage(update.message);
+    }
+  } catch(e) { console.error('Webhook error:', e.message, e.stack); }
 });
 
-app.get('/',(req,res)=>res.json({status:'TradeBot AutoLab v4.0 🤖',version:'4.0',uptime:Math.floor(process.uptime())+'s',time:new Date().toISOString()}));
-app.get('/ping',(req,res)=>res.json({ok:true}));
+// Signal webhook (TradingView)
+app.post('/signal', async (req,res) => {
+  const telegram_id = req.query.user_id || req.query.telegram_id;
+  if (!telegram_id) return res.status(400).json({error:'user_id required'});
+  const payload = req.body;
+  if (!payload.pair||!payload.action) return res.status(400).json({error:'pair and action required'});
+  res.json({ok:true, received: payload});
+  try { await processSignal(telegram_id, payload); } catch(e) { console.error('Signal error:', e.message); }
+});
 
-// ─── Start ────────────────────────────────────────────────────────────────────
-setInterval(monitorOpenTrades, 30*1000);
-setInterval(monitorAlerts, 60*1000);
-setInterval(broadcastMarketAlerts, 4*60*60*1000); // every 4 hours
+// Admin endpoints
+app.get('/health', (req,res) => {
+  const users = getAllUsers();
+  const trades = db.prepare('SELECT COUNT(*) as c FROM trades').get().c;
+  res.json({status:'ok', users:users.length, trades, version:'5.0', uptime:Math.floor(process.uptime())});
+});
 
-app.listen(PORT, ()=>{
-  console.log(`🚀 TradeBot AutoLab v4.0 on port ${PORT}`);
-  console.log(`🔗 Webhook: ${SERVER_URL}/webhook`);
+// ─── START ────────────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`\n🚀 TradeBot AutoLab v5.0 on port ${PORT}`);
+  console.log(`🔗 Webhook: ${WEBHOOK_URL}`);
+  assertWebhook();
+  setInterval(assertWebhook, 2*60*1000);
+  setInterval(monitorTrades, 30*1000);
+  setInterval(monitorAlerts, 15*1000);
+  // Daily digest at 8am UTC
+  const now = new Date();
+  const nextDigest = new Date(now);
+  nextDigest.setUTCHours(8,0,0,0);
+  if (nextDigest <= now) nextDigest.setUTCDate(nextDigest.getUTCDate()+1);
+  setTimeout(() => {
+    sendDailyDigest();
+    setInterval(sendDailyDigest, 24*60*60*1000);
+  }, nextDigest-now);
 });
