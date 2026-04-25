@@ -335,11 +335,13 @@ function elapsed(dateStr) {
   return `${s}s`;
 }
 function planBadge(plan) {
-  if (plan==='pro') return '💎 PRO';
+  if ((plan||'').toLowerCase()==='pro') return '💎 PRO';
   return '🆓 FREE';
 }
 function isPro(user) {
-  if (!user || user.plan !== 'pro') return false;
+  if (!user) return false;
+  const plan = (user.plan||'').toLowerCase();
+  if (plan !== 'pro') return false;
   if (!user.plan_expires) return true;
   return new Date(user.plan_expires) > new Date();
 }
@@ -825,6 +827,7 @@ async function handleCallback(callback) {
   // ── Main menu ──
   if (data==='menu_main') {
     updateUser(user.id, {onboarding_step:'', onboarding_data:{}, support_thread_open:0});
+    user = getUser(chat_id) || user;
     await sendMainMenu(chat_id, user);
 
   // ── Create strategy ──
@@ -1345,6 +1348,7 @@ async function handleMessage(msg) {
   // Commands
   if (text.startsWith('/start')||text==='/menu') {
     updateUser(user.id, {bot_stopped:false, onboarding_step:'', onboarding_data:{}, support_thread_open:0});
+    user = getUser(chat_id) || user;
     const isNew = text.startsWith('/start pro_success');
     await sendMainMenu(chat_id, user, isNew?'💎 <b>PRO activated!</b> Welcome to the big leagues 🚀':'');
   } else if (text==='/help'||text==='/faq') {
@@ -1402,12 +1406,24 @@ app.post('/webhook', async (req,res) => {
   res.json({ok:true}); // respond fast
   try {
     const update = req.body;
+    if (!update) return;
     if (update.callback_query) {
-      await handleCallback(update.callback_query);
+      const cq = update.callback_query;
+      const cid = cq?.message?.chat?.id || cq?.from?.id;
+      console.log(`[CB] from=${cid} data=${cq?.data}`);
+      await handleCallback(cq).catch(async e => {
+        console.error('[CB ERROR]', e.message, e.stack);
+        try { await sendTelegram(String(cid), '⚠️ An error occurred. Please try again or send /start'); } catch(_) {}
+      });
     } else if (update.message) {
-      await handleMessage(update.message);
+      const mid = update.message?.chat?.id;
+      console.log(`[MSG] from=${mid} text=${(update.message?.text||'').substring(0,30)}`);
+      await handleMessage(update.message).catch(async e => {
+        console.error('[MSG ERROR]', e.message, e.stack);
+        try { await sendTelegram(String(mid), '⚠️ An error occurred. Send /start to restart.'); } catch(_) {}
+      });
     }
-  } catch(e) { console.error('Webhook error:', e.message, e.stack); }
+  } catch(e) { console.error('Webhook fatal:', e.message, e.stack); }
 });
 
 // Signal webhook (TradingView)
