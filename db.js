@@ -119,7 +119,7 @@ function getUser(telegram_id) {
 function getAllUsers() { return db.prepare('SELECT * FROM bot_users').all().map(r=>({...r,bot_stopped:!!r.bot_stopped,auto_trade_enabled:!!r.auto_trade_enabled})); }
 function createUser(data) {
   const id = genId();
-  db.prepare(`INSERT INTO bot_users (id,telegram_id,telegram_username,first_name,onboarding_data) VALUES (?,?,?,?,?)`).run(id,data.telegram_id,data.telegram_username||'',data.first_name||','||'{}');
+  db.prepare(`INSERT INTO bot_users (id,telegram_id,telegram_username,first_name,onboarding_data) VALUES (?,?,?,?,?)`).run(id, data.telegram_id, data.telegram_username||'', data.first_name||'', '{}');
   return getUser(data.telegram_id);
 }
 function updateUser(id, data) {
