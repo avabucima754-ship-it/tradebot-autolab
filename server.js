@@ -1403,6 +1403,12 @@ app.post('/stripe-webhook', express.raw({type:'application/json'}), async (req,r
 
 // Telegram webhook
 app.post('/webhook', async (req,res) => {
+  // Block Base44 interception - validate secret token
+  const secret = req.headers['x-telegram-bot-api-secret-token'];
+  if (secret && secret !== 'TradeBot_AutoLab_2026_Secure') {
+    console.log('[BLOCKED] Bad secret token:', secret);
+    return res.sendStatus(403);
+  }
   res.json({ok:true}); // respond fast
   try {
     const update = req.body;
