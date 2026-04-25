@@ -1,0 +1,7 @@
+[phases.setup]
+nixPkgs = ["nodejs-18_x"]
+
+[start]
+cmd = "node server.js"
+
+# cache-bust: 1777111765
