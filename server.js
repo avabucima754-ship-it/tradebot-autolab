@@ -1,6 +1,6 @@
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║        TradeBot AutoLab v4.0 — Professional AI Trading Engine           ║
-// CACHE-BUST: 1777113363
+// CACHE-BUST: 1777113730
 // ║        With self-healing webhook, AI assistant, news, charts, FAQ       ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 const express = require('express');
