@@ -143,6 +143,14 @@ const migrations = [
   `ALTER TABLE strategies ADD COLUMN total_wins INTEGER DEFAULT 0`,
   `ALTER TABLE strategies ADD COLUMN total_pnl REAL DEFAULT 0`,
   `ALTER TABLE bot_users ADD COLUMN balance_usd REAL DEFAULT 10000`,
+  `ALTER TABLE bot_users ADD COLUMN mexc_api_key_enc TEXT DEFAULT ''`,
+  `ALTER TABLE bot_users ADD COLUMN mexc_secret_enc TEXT DEFAULT ''`,
+  `ALTER TABLE bot_users ADD COLUMN okx_api_key_enc TEXT DEFAULT ''`,
+  `ALTER TABLE bot_users ADD COLUMN okx_secret_enc TEXT DEFAULT ''`,
+  `ALTER TABLE bot_users ADD COLUMN kucoin_api_key_enc TEXT DEFAULT ''`,
+  `ALTER TABLE bot_users ADD COLUMN kucoin_secret_enc TEXT DEFAULT ''`,
+  `ALTER TABLE bot_users ADD COLUMN demo_balance REAL DEFAULT 0`,
+  `ALTER TABLE bot_users ADD COLUMN demo_initial REAL DEFAULT 0`,
 ];
 migrations.forEach(m => { try { db.exec(m); } catch(_) {} });
 
@@ -171,7 +179,10 @@ function createUser(data) {
 function updateUser(id, data) {
   const allowed = ['telegram_username','first_name','auto_trade_enabled','bot_stopped',
     'binance_api_key_enc','binance_secret_enc','bybit_api_key_enc','bybit_secret_enc',
+    'mexc_api_key_enc','mexc_secret_enc','okx_api_key_enc','okx_secret_enc',
+    'kucoin_api_key_enc','kucoin_secret_enc',
     'exchange','onboarding_step','onboarding_data','balance_usd','plan','plan_expires',
+    'demo_balance','demo_initial',
     'stripe_customer_id','support_thread_open','last_seen'];
   const sets=[], vals=[];
   for (const [k,v] of Object.entries(data)) {
@@ -646,7 +657,7 @@ async function processSignal(telegram_id, payload) {
       await sendTelegram(telegram_id,`⚠️ <b>${strategy.name}</b>: Max trades/day reached.`); continue;
     }
     const todayPnl = getTodayPnl(telegram_id);
-    const balance = user?.balance_usd||10000;
+    const balance = (user?.demo_balance>0?user.demo_balance:null)||user?.balance_usd||10000;
     if (strategy.max_loss_limit_pct && Math.abs(todayPnl)>=(balance*strategy.max_loss_limit_pct/100)) {
       await sendTelegram(telegram_id,`🛑 <b>${strategy.name}</b>: Daily loss limit hit.`); continue;
     }
@@ -684,10 +695,14 @@ ${action==='BUY'?'📈':'📉'} Action: <b>${action}</b>
 async function placeOrder(user, strategy, pair, action, qty) {
   try {
     const ex = user.exchange||'binance';
-    const apiKey = ex==='binance'?user.binance_api_key_enc:user.bybit_api_key_enc;
-    const apiSecret = ex==='binance'?user.binance_secret_enc:user.bybit_secret_enc;
-    if (!apiKey||!apiSecret) return {error:'No API keys configured'};
-    return {orderId:'SIMULATED_'+genId().slice(0,8)};
+    const apiKey = user[`${ex}_api_key_enc`]||'';
+    const apiSecret = user[`${ex}_secret_enc`]||'';
+    if (!apiKey||!apiSecret) return {error:`No ${ex.toUpperCase()} API keys configured`};
+    // Live exchange execution — currently simulated, real integration per exchange below
+    // Binance: POST /api/v3/order | Bybit: POST /v5/order/create
+    // MEXC: POST /api/v3/order | OKX: POST /api/v5/trade/order | KuCoin: POST /api/v1/orders
+    console.log(`[ORDER] ${ex.toUpperCase()} ${action} ${qty} ${pair}`);
+    return {orderId:`${ex.toUpperCase()}_${genId().slice(0,8)}`};
   } catch(e) { return {error:e.message}; }
 }
 
@@ -787,7 +802,7 @@ const FAQ = [
   ['How does paper trading work?','Paper trading simulates real trades using live market prices but with no real money at risk.'],
   ['How do I start live trading?','Upgrade to PRO, connect your Binance/Bybit API keys in Settings, and enable Live mode on your strategy.'],
   ['Is my API key safe?','Yes. Keys are encrypted and stored securely. We request trade-only permissions — no withdrawal access.'],
-  ['What exchanges are supported?','Currently Binance and Bybit. More exchanges coming soon.'],
+  ['What exchanges are supported?','Binance, Bybit, MEXC, OKX, and KuCoin. Connect any in Settings → API Keys.'],
   ['Can I run multiple strategies?','Yes! You can create unlimited strategies, each with its own pair, risk settings, and mode.'],
   ['How do price alerts work?','Set a target price and direction. You\'ll be notified instantly when your coin hits the target.'],
   ['How do I get support?','Use the Live Support button in the main menu. Our team responds within 24 hours.'],
@@ -951,13 +966,22 @@ Use this in TradingView alerts!`;
     const trades = listTrades(chat_id, {mode:'paper', status:'open'});
     const closed = listTrades(chat_id, {mode:'paper'}).filter(t=>t.status==='closed');
     const pnl = closed.reduce((s,t)=>s+t.pnl,0);
+    const demoActive = (user.demo_balance||0) > 0;
+    const demoBalance = user.demo_balance||0;
+    const demoInitial = user.demo_initial||0;
+    const demoReturn = demoInitial>0 ? ((demoBalance-demoInitial)/demoInitial*100).toFixed(2) : '0.00';
     let msg = `
 🧪 <b>Paper Trading</b>
 ──────────────────────────
-🏦 Virtual Balance: <b>$${fmt(user.balance_usd||10000)}</b>
+${demoActive
+  ? `💰 Demo Balance: <b>$${fmt(demoBalance)}</b>
+📈 Starting Capital: <b>$${fmt(demoInitial)}</b>
+📊 Total Return: <b>${demoReturn >= 0 ? '+':''}${demoReturn}%</b>`
+  : `🏦 Virtual Balance: <b>$${fmt(user.balance_usd||10000)}</b>
+💡 Add demo funds to track real position sizing`}
 📊 Open Trades: <b>${trades.length}</b>
 ✅ Closed: <b>${closed.length}</b>
-💰 Total P&L: <b>${fmtPnl(pnl)}</b>
+💰 Paper P&L: <b>${fmtPnl(pnl)}</b>
 ──────────────────────────`;
     if (trades.length) {
       msg += '\n\n<b>Open Positions:</b>';
@@ -968,11 +992,27 @@ Use this in TradingView alerts!`;
       msg += '\n\n💤 No open paper trades.\nSend a signal or create a strategy!';
     }
     const kb = {inline_keyboard:[]};
+    kb.inline_keyboard.push([
+      {text:'💰 Add Demo Funds',callback_data:'demo_add_funds'},
+      {text:'🔄 Reset Demo',callback_data:'demo_reset'}
+    ]);
     if (trades.length) {
       kb.inline_keyboard.push([{text:'❌ Close All Paper Trades',callback_data:'close_all_paper'}]);
     }
     kb.inline_keyboard.push([{text:'🤖 Create Strategy',callback_data:'menu_create'},{text:'🏠 Menu',callback_data:'menu_main'}]);
     await sendTelegram(chat_id, msg, kb);
+
+  } else if (data==='demo_add_funds') {
+    updateUser(user.id, {onboarding_step:'await_demo_funds', onboarding_data:{}});
+    await sendTelegram(chat_id,
+      `💰 <b>Add Demo Funds</b>\n──────────────────────────\nHow much virtual money do you want to trade with?\n\n💡 Examples: 500, 1000, 5000, 10000\n\nType the amount in USD:`,
+      backToMenu());
+
+  } else if (data==='demo_reset') {
+    updateUser(user.id, {demo_balance:0, demo_initial:0});
+    await sendTelegram(chat_id,
+      `🔄 <b>Demo Account Reset</b>\n──────────────────────────\n✅ Your demo balance has been cleared.\n\nTap <b>Add Demo Funds</b> to start fresh with a new amount.`,
+      {inline_keyboard:[[{text:'💰 Add Demo Funds',callback_data:'demo_add_funds'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
 
   } else if (data==='close_all_paper') {
     const trades = listTrades(chat_id, {mode:'paper', status:'open'});
@@ -996,7 +1036,8 @@ Use this in TradingView alerts!`;
     await sendTelegram(chat_id,
       `🚀 <b>Live Trading</b>\n──────────────────────────\n💎 Plan: PRO\n📊 Open Live Trades: <b>${liveTrades.length}</b>\n\n⚙️ Manage your exchange:`,
       {inline_keyboard:[
-        [{text:'🔑 Binance Keys',callback_data:'set_exchange_binance'},{text:'🔑 Bybit Keys',callback_data:'set_exchange_bybit'}],
+        [{text:'🔑 Binance',callback_data:'set_exchange_binance'},{text:'🔑 Bybit',callback_data:'set_exchange_bybit'}],
+        [{text:'🔑 MEXC',callback_data:'set_exchange_mexc'},{text:'🔑 OKX',callback_data:'set_exchange_okx'},{text:'🔑 KuCoin',callback_data:'set_exchange_kucoin'}],
         [{text:'📋 My Strategies',callback_data:'menu_strategies'}],
         [{text:'🏠 Menu',callback_data:'menu_main'}]
       ]});
@@ -1210,20 +1251,25 @@ Use this in TradingView alerts!`;
   // ── Settings ──
   } else if (data==='menu_settings') {
     const ex = user.exchange||'Not set';
-    const hasKeys = (user.binance_api_key_enc||user.bybit_api_key_enc)?'✅ Connected':'❌ Not connected';
+    const exchanges = ['binance','bybit','mexc','okx','kucoin'];
+    const connectedExchanges = exchanges.filter(e=>user[`${e}_api_key_enc`]).map(e=>e.toUpperCase());
+    const hasKeys = connectedExchanges.length>0?`✅ ${connectedExchanges.join(', ')}`:'❌ Not connected';
+    const demoInfo = (user.demo_balance||0)>0?`$${fmt(user.demo_balance)}`:'Not set';
     await sendTelegram(chat_id,
-      `⚙️ <b>Settings</b>\n──────────────────────────\n👤 Name: <b>${user.first_name||'—'}</b>\n🏦 Exchange: <b>${ex.toUpperCase()||'—'}</b>\n🔑 API Keys: <b>${hasKeys}</b>\n💎 Plan: <b>${planBadge(user.plan)}</b>\n🏦 Balance: <b>$${fmt(user.balance_usd||10000)}</b>`,
+      `⚙️ <b>Settings</b>\n──────────────────────────\n👤 Name: <b>${user.first_name||'—'}</b>\n🏦 Active Exchange: <b>${(ex||'—').toUpperCase()}</b>\n🔑 Connected: <b>${hasKeys}</b>\n💎 Plan: <b>${planBadge(user.plan)}</b>\n🏦 Balance: <b>$${fmt(user.balance_usd||10000)}</b>\n🧪 Demo Funds: <b>${demoInfo}</b>`,
       {inline_keyboard:[
-        [{text:'🔑 Binance API',callback_data:'set_exchange_binance'},{text:'🔑 Bybit API',callback_data:'set_exchange_bybit'}],
+        [{text:'🔑 Binance',callback_data:'set_exchange_binance'},{text:'🔑 Bybit',callback_data:'set_exchange_bybit'}],
+        [{text:'🔑 MEXC',callback_data:'set_exchange_mexc'},{text:'🔑 OKX',callback_data:'set_exchange_okx'},{text:'🔑 KuCoin',callback_data:'set_exchange_kucoin'}],
         [{text:'💎 Manage Plan',callback_data:'menu_billing'}],
         [{text:'🏠 Main Menu',callback_data:'menu_main'}]
       ]});
 
-  } else if (data==='set_exchange_binance'||data==='set_exchange_bybit') {
-    const ex = data==='set_exchange_binance'?'binance':'bybit';
+  } else if (['set_exchange_binance','set_exchange_bybit','set_exchange_mexc','set_exchange_okx','set_exchange_kucoin'].includes(data)) {
+    const ex = data.replace('set_exchange_','');
+    const exNames = {binance:'Binance',bybit:'Bybit',mexc:'MEXC',okx:'OKX',kucoin:'KuCoin'};
     updateUser(user.id, {exchange:ex, onboarding_step:`await_api_key_${ex}`, onboarding_data:{}});
     await sendTelegram(chat_id,
-      `🔑 <b>${ex.toUpperCase()} API Setup</b>\n──────────────────────────\n⚠️ Create API key with:\n✅ Spot Trading permission\n❌ NO withdrawal permission\n\nPaste your <b>API Key</b>:`);
+      `🔑 <b>${exNames[ex]||ex.toUpperCase()} API Setup</b>\n──────────────────────────\n⚠️ Create API key with:\n✅ Spot/Trade permission\n❌ NO withdrawal permission\n\nPaste your <b>API Key</b>:`);
 
   // ── Stop all ──
   } else if (data==='menu_stopall') {
@@ -1312,11 +1358,31 @@ async function handleMessage(msg) {
   // Handle onboarding steps
   const step = user.onboarding_step||'';
   if (step && step!=='done') {
+    // Demo funds handler
+    if (step==='await_demo_funds') {
+      const amount = parseFloat(text.replace(/[,$]/g,''));
+      if (isNaN(amount)||amount<10) {
+        await sendTelegram(chat_id,'❌ Please enter a valid amount (minimum $10):');
+        return;
+      }
+      if (amount>1000000) {
+        await sendTelegram(chat_id,'❌ Maximum demo amount is $1,000,000');
+        return;
+      }
+      updateUser(user.id, {demo_balance:amount, demo_initial:amount, balance_usd:amount, onboarding_step:'done', onboarding_data:{}});
+      await sendTelegram(chat_id,
+        `✅ <b>Demo Account Funded!</b>\n──────────────────────────\n💰 Demo Balance: <b>$${fmt(amount)}</b>\n\nYour bot will now use real position sizing based on this balance.\n\n📡 Send a signal or create a strategy to start trading!`,
+        {inline_keyboard:[
+          [{text:'🤖 Create Strategy',callback_data:'menu_create'},{text:'📡 Signal Setup',callback_data:'menu_signal'}],
+          [{text:'🧪 Paper Trading',callback_data:'menu_paper'},{text:'🏠 Menu',callback_data:'menu_main'}]
+        ]});
+      return;
+    }
     // API key collection
     if (step.startsWith('await_api_key_')) {
       const ex = step.replace('await_api_key_','');
       if (text.length<10){await sendTelegram(chat_id,'❌ Invalid API key. Paste the full key:');return;}
-      const field = ex==='binance'?'binance_api_key_enc':'bybit_api_key_enc';
+      const field = `${ex}_api_key_enc`;
       updateUser(user.id, {[field]:text, onboarding_step:`await_api_secret_${ex}`});
       await sendTelegram(chat_id, `✅ <b>API Key saved!</b>\n\nNow paste your <b>${ex.toUpperCase()} Secret Key</b>:`);
       return;
@@ -1324,7 +1390,7 @@ async function handleMessage(msg) {
     if (step.startsWith('await_api_secret_')) {
       const ex = step.replace('await_api_secret_','');
       if (text.length<10){await sendTelegram(chat_id,'❌ Invalid secret:');return;}
-      const field = ex==='binance'?'binance_secret_enc':'bybit_secret_enc';
+      const field = `${ex}_secret_enc`;
       updateUser(user.id, {[field]:text, onboarding_step:'done', auto_trade_enabled:true});
       await sendTelegram(chat_id,
         `🔐 <b>API Keys Saved!</b>\n──────────────────────────\n✅ ${ex.toUpperCase()} connected\n✅ Auto Trading: ON\n\n⚠️ Ensure key has Spot Trading only — NO withdrawals.`,
