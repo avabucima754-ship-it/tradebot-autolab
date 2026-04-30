@@ -1008,11 +1008,6 @@ ${demoActive
       `💰 <b>Add Demo Funds</b>\n──────────────────────────\nHow much virtual money do you want to trade with?\n\n💡 Examples: 500, 1000, 5000, 10000\n\nType the amount in USD:`,
       backToMenu());
 
-  } else if (data==='demo_add_funds') {
-    updateUser(user.id, {onboarding_step:'await_demo_funds', onboarding_data:{}});
-    await sendTelegram(chat_id,
-      `💰 <b>Add Demo Funds</b>\n──────────────────────────\nHow much virtual money do you want to trade with?\n\n💡 Examples: 500 · 1000 · 5000 · 10000\n\nType any amount in USD:`,
-      backToMenu());
 
   } else if (data==='demo_reset') {
     updateUser(user.id, {demo_balance:0, demo_initial:0, balance_usd:10000});
