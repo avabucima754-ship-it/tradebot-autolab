@@ -1014,6 +1014,18 @@ ${demoActive
       `🔄 <b>Demo Account Reset</b>\n──────────────────────────\n✅ Your demo balance has been cleared.\n\nTap <b>Add Demo Funds</b> to start fresh with a new amount.`,
       {inline_keyboard:[[{text:'💰 Add Demo Funds',callback_data:'demo_add_funds'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
 
+  } else if (data==='demo_add_funds') {
+    updateUser(user.id, {onboarding_step:'await_demo_funds', onboarding_data:{}});
+    await sendTelegram(chat_id,
+      `💰 <b>Add Demo Funds</b>\n──────────────────────────\nHow much virtual money do you want to trade with?\n\n💡 Examples: 500 · 1000 · 5000 · 10000\n\nType any amount in USD:`,
+      backToMenu());
+
+  } else if (data==='demo_reset') {
+    updateUser(user.id, {demo_balance:0, demo_initial:0, balance_usd:10000});
+    await sendTelegram(chat_id,
+      `🔄 <b>Demo Account Reset</b>\n──────────────────────────\n✅ Demo balance cleared. Virtual balance restored to $10,000.\n\nTap <b>Add Demo Funds</b> to start fresh with your own amount.`,
+      {inline_keyboard:[[{text:'💰 Add Demo Funds',callback_data:'demo_add_funds'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
+
   } else if (data==='close_all_paper') {
     const trades = listTrades(chat_id, {mode:'paper', status:'open'});
     let closed=0;
