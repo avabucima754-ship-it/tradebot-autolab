@@ -865,7 +865,7 @@ Select your market:`;
 
   } else if (['market_crypto','market_forex','market_stocks'].includes(data)) {
     const market = data.replace('market_','');
-    updateUser(user.id, {onboarding_data:{...od,market}, onboarding_step:'select_pair'}); od = getOd(); od = getOd();
+    updateUser(user.id, {onboarding_data:{...od,market}, onboarding_step:'select_pair'}); od = getOd();
     const pairs = market==='crypto'?[
       ['BTCUSDT','ETHUSDT'],['BNBUSDT','SOLUSDT'],['XRPUSDT','DOGEUSDT'],['Other (type it)','']
     ] : market==='forex'?[
@@ -888,7 +888,7 @@ Select your market:`;
       await sendTelegram(chat_id, '✍️ Type your pair (e.g. BTCUSDT, AAPL):');
       return;
     }
-    updateUser(user.id, {onboarding_data:{...od,pair}, onboarding_step:'select_entry'}); od = getOd(); od = getOd();
+    updateUser(user.id, {onboarding_data:{...od,pair}, onboarding_step:'select_entry'}); od = getOd();
     await sendTelegram(chat_id, `✅ Pair: <b>${pair}</b>\n\n📋 <b>Select entry type:</b>`, {inline_keyboard:[
       [{text:'📡 TradingView Signal',callback_data:'entry_signal'},{text:'🔔 Price Alert',callback_data:'entry_alert'}],
       [{text:'🤖 Auto (AI)',callback_data:'entry_ai'}],
@@ -897,7 +897,7 @@ Select your market:`;
 
   } else if (data.startsWith('entry_')) {
     const entry = data.replace('entry_','');
-    updateUser(user.id, {onboarding_data:{...od,entry}, onboarding_step:'await_tp'}); od = getOd(); od = getOd();
+    updateUser(user.id, {onboarding_data:{...od,entry}, onboarding_step:'await_tp'}); od = getOd();
     await sendTelegram(chat_id, `✅ Entry: <b>${entry.toUpperCase()}</b>\n\n🎯 <b>Take Profit %</b>\n(e.g. 3 means +3% from entry):`);
 
   } else if (data.startsWith('set_mode_')) {
