@@ -1829,6 +1829,13 @@ app.post('/signal', async (req,res) => {
 });
 
 // Admin endpoints
+app.get('/price', async (req, res) => {
+  const pair = (req.query.pair||'BTCUSDT').toUpperCase();
+  const price = await fetchPrice(pair);
+  res.json({pair, price, ok: price !== null, ts: Date.now()});
+});
+
+
 app.get('/health', (req,res) => {
   const users = getAllUsers();
   const trades = db.prepare('SELECT COUNT(*) as c FROM trades').get().c;
