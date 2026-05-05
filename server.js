@@ -749,42 +749,44 @@ async function placeOrder(user, strategy, pair, action, qty) {
 
 // ─── ONBOARDING FSM ──────────────────────────────────────────────────────────
 async function handleOnboarding(chat_id, user, step, text) {
-  // Always read fresh onboarding_data to avoid stale state bugs
-  const getOd = () => { const u = getUser(chat_id); return u?.onboarding_data||{}; };
-  let od = getOd();
+  // ALWAYS re-fetch user + od fresh from DB to avoid stale state
+  const freshUser = getUser(chat_id) || user;
+  const od = freshUser.onboarding_data || {};
+
   if (step==='await_tp') {
-    const tp=parseFloat(text);
-    if (isNaN(tp)||tp<=0||tp>100){await sendTelegram(chat_id,'❌ Enter a valid Take Profit % (e.g. 3):');return;}
-    updateUser(user.id,{onboarding_data:{...od,tp},onboarding_step:'await_sl'});
-    await sendTelegram(chat_id,`✅ TP: <b>${tp}%</b>\n\n🛡️ <b>Enter Stop Loss %</b>\n💡 Good R:R = TP > SL (e.g. 1.5):`);
+    const tp = parseFloat(text);
+    if (isNaN(tp)||tp<=0||tp>100) { await sendTelegram(chat_id,'❌ Enter Take Profit % (e.g. 3):'); return; }
+    updateUser(freshUser.id, {onboarding_data:{...od, tp}, onboarding_step:'await_sl'});
+    await sendTelegram(chat_id,
+      `✅ TP set: <b>${tp}%</b>
+
+🛡️ <b>Stop Loss %</b> (e.g. 1.5)
+💡 Tip: Keep SL smaller than TP for good risk/reward:`);
+
   } else if (step==='await_sl') {
-    const sl=parseFloat(text);
-    if (isNaN(sl)||sl<=0||sl>50){await sendTelegram(chat_id,'❌ Enter valid SL % (e.g. 1.5):');return;}
-    const rr=(od.tp/sl).toFixed(1);
-    const rremoji=parseFloat(rr)>=2?'🏆':parseFloat(rr)>=1.5?'✅':'⚠️';
-    updateUser(user.id,{onboarding_data:{...od,sl},onboarding_step:'await_risk'});
-    await sendTelegram(chat_id,`✅ SL: <b>${sl}%</b> | ${rremoji} R:R 1:${rr}\n\n💸 <b>Risk per trade %</b> (e.g. 1)\n💡 Never risk more than 2%:`);
-  } else if (step==='await_risk') {
-    const r=parseFloat(text);
-    if (isNaN(r)||r<=0||r>10){await sendTelegram(chat_id,'❌ Enter 0.1–10 (e.g. 1):');return;}
-    updateUser(user.id,{onboarding_data:{...od,risk:r},onboarding_step:'await_max_trades'});
-    await sendTelegram(chat_id,`✅ Risk: <b>${r}%/trade</b>\n\n🔢 <b>Max trades per day</b> (e.g. 5):`);
-  } else if (step==='await_max_trades') {
-    const mt=parseInt(text);
-    if (isNaN(mt)||mt<=0||mt>50){await sendTelegram(chat_id,'❌ Enter 1–50:');return;}
-    updateUser(user.id,{onboarding_data:{...od,max_trades:mt},onboarding_step:'await_max_loss'});
-    await sendTelegram(chat_id,`✅ Max: <b>${mt} trades/day</b>\n\n🚨 <b>Max daily loss %</b> (e.g. 5)\nBot stops trading if this is hit:`);
-  } else if (step==='await_max_loss') {
-    const ml=parseFloat(text);
-    if (isNaN(ml)||ml<=0||ml>50){await sendTelegram(chat_id,'❌ Enter 0.1–50:');return;}
-    updateUser(user.id,{onboarding_data:{...od,max_loss:ml},onboarding_step:'await_strategy_name'});
-    await sendTelegram(chat_id,`✅ Max loss: <b>${ml}%/day</b>\n\n🏷️ <b>Name your strategy</b> (e.g. BTC Scalper):`);
+    const sl = parseFloat(text);
+    if (isNaN(sl)||sl<=0||sl>50) { await sendTelegram(chat_id,'❌ Enter Stop Loss % (e.g. 1.5):'); return; }
+    const tp = od.tp || 2;
+    const rr = (tp/sl).toFixed(1);
+    const rrEmoji = parseFloat(rr)>=2?'🏆':parseFloat(rr)>=1.5?'✅':'⚠️';
+    updateUser(freshUser.id, {onboarding_data:{...od, sl}, onboarding_step:'await_strategy_name'});
+    await sendTelegram(chat_id,
+      `✅ SL set: <b>${sl}%</b>  ${rrEmoji} R:R = 1:${rr}
+
+🏷️ <b>Name your strategy</b> (e.g. BTC Scalper):`);
+
   } else if (step==='await_strategy_name') {
-    const name=text.trim();
-    if (!name||name.length<2){await sendTelegram(chat_id,'❌ At least 2 characters:');return;}
-    updateUser(user.id,{onboarding_data:{...od,name},onboarding_step:'await_mode'});
-    await sendTelegram(chat_id,`✅ Name: <b>${name}</b>\n\n🔵 <b>Select trading mode:</b>`,
-      {inline_keyboard:[[{text:'🧪 Paper (Simulated)',callback_data:'set_mode_paper'},{text:'🚀 Live Trading',callback_data:'set_mode_live'}]]});
+    const name = text.trim();
+    if (!name||name.length<2) { await sendTelegram(chat_id,'❌ Minimum 2 characters:'); return; }
+    updateUser(freshUser.id, {onboarding_data:{...od, name}, onboarding_step:'await_mode'});
+    await sendTelegram(chat_id,
+      `✅ Name: <b>${name}</b>
+
+🔵 <b>Choose mode:</b>`,
+      {inline_keyboard:[
+        [{text:'🧪 Paper (Demo)',callback_data:'set_mode_paper'},{text:'🚀 Live Trading',callback_data:'set_mode_live'}]
+      ]});
+
   } else if (step==='await_alert_pair') {
     const pair=text.trim().toUpperCase().replace('/','');
     updateUser(user.id,{onboarding_data:{...od,alert_pair:pair},onboarding_step:'await_alert_price'});
@@ -981,9 +983,14 @@ Select your market:`;
 Use this in TradingView alerts!`;
     if (mode==='paper') {
       await sendTelegram(chat_id, msg, {inline_keyboard:[
-        [{text:'📈 BUY Now',callback_data:'demo_quick_buy'},{text:'📉 SELL Now',callback_data:'demo_quick_sell'}],
+        [{text:'📈 Open BUY Trade Now',callback_data:'demo_quick_buy'},{text:'📉 Open SELL Trade',callback_data:'demo_quick_sell'}],
         [{text:'📊 Demo Dashboard',callback_data:'menu_paper'},{text:'🏠 Menu',callback_data:'menu_main'}]
       ]});
+      // Auto-open first paper trade immediately so user sees it working
+      await sendTelegram(chat_id, `⏳ <b>Opening your first demo trade on ${od.pair||'BTCUSDT'}...</b>`);
+      try {
+        await processSignal(chat_id, {pair: od.pair||'BTCUSDT', action:'BUY', price:null});
+      } catch(e) { console.error('Auto open trade:', e.message); }
     } else {
       await sendTelegram(chat_id, msg, {inline_keyboard:[
         [{text:'📡 Signal Guide',callback_data:'menu_signal'},{text:'📊 Dashboard',callback_data:'menu_paper'}],
@@ -1161,17 +1168,38 @@ ${returnEmoji} Total Return: <b>${parseFloat(totalReturn)>=0?'+':''}${totalRetur
     await processSignal(chat_id, {pair:s.pair, action, price:null});
 
   } else if (data==='demo_chart') {
-    // Show chart for user's first active paper strategy pair
-    const strategies = listStrategies(chat_id).filter(s=>s.mode==='paper'&&s.is_active);
-    const pair = strategies.length?strategies[0].pair:'BTCUSDT';
-    await sendTelegram(chat_id, `📉 <b>Fetching chart for ${pair}...</b>`);
-    const price = await fetchPrice(pair)||0;
+    const strategies = listStrategies(chat_id).filter(s=>s.is_active);
+    const pair = strategies.length ? strategies[0].pair : 'BTCUSDT';
+    // Normalize pair for TradingView (e.g. BTCUSDT → BINANCE:BTCUSDT)
+    const tvSymbol = pair.includes(':') ? pair : `BINANCE:${pair}`;
+    const tvUrl = `https://www.tradingview.com/chart/?symbol=${tvSymbol}&interval=240`;
+    const price = await fetchPrice(pair) || 0;
+    // Also build mini text chart from candles
     const candles = await fetch4hCandles(pair);
-    const chart = renderChart(candles, pair, price);
-    await sendTelegram(chat_id, chart,
+    let miniChart = '';
+    if (candles.length >= 6) {
+      const last6 = candles.slice(-6);
+      const closes = last6.map(c=>c.close);
+      const pctChanges = closes.map((c,i)=> i===0 ? 0 : ((c-closes[i-1])/closes[i-1]*100));
+      miniChart = '\n\n<b>Last 6 candles (4H):</b>\n<code>';
+      pctChanges.slice(1).forEach(p => {
+        miniChart += p>=0 ? `▲ +${p.toFixed(2)}%\n` : `▼ ${p.toFixed(2)}%\n`;
+      });
+      miniChart += '</code>';
+    }
+    const openTrades = listTrades(chat_id, {status:'open'}).filter(t=>t.pair===pair);
+    let tradeInfo = '';
+    if (openTrades.length) {
+      const t = openTrades[0];
+      const uPnl = t.action==='BUY'?(price-t.entry_price)*t.quantity:(t.entry_price-price)*t.quantity;
+      tradeInfo = `\n\n🔴 <b>Your open position:</b>\n${t.action} @ $${fmt(t.entry_price,4)} | Now $${fmt(price,4)}\nP&L: <b>${fmtPnl(uPnl)}</b>`;
+    }
+    await sendTelegram(chat_id,
+      `📊 <b>${pair} Chart</b>\n──────────────────────────\n💵 Current Price: <b>$${fmt(price,4)}</b>${miniChart}${tradeInfo}\n\n📈 <b>View full interactive chart:</b>\n${tvUrl}`,
       {inline_keyboard:[
-        [{text:'🔄 Refresh',callback_data:'demo_chart'},{text:'📈 BUY',callback_data:'demo_quick_buy'},{text:'📉 SELL',callback_data:'demo_quick_sell'}],
-        [{text:'🧪 Demo Dashboard',callback_data:'menu_paper'},{text:'🏠 Menu',callback_data:'menu_main'}]
+        [{text:'🔄 Refresh',callback_data:'demo_chart'}],
+        [{text:'📈 BUY Now',callback_data:'demo_quick_buy'},{text:'📉 SELL Now',callback_data:'demo_quick_sell'}],
+        [{text:'🧪 Dashboard',callback_data:'menu_paper'},{text:'🏠 Menu',callback_data:'menu_main'}]
       ]});
 
   } else if (data==='demo_history') {
@@ -1622,7 +1650,7 @@ const app = express();
 app.use(express.json());
 
 app.get('/', (req,res) => {
-  res.json({status:'TradeBot AutoLab v5.0 🤖', version:'8.0', uptime:`${Math.floor(process.uptime())}s`, time:new Date().toISOString()});
+  res.json({status:'TradeBot AutoLab v5.0 🤖', version:'9.0', uptime:`${Math.floor(process.uptime())}s`, time:new Date().toISOString()});
 });
 
 // Stripe webhook for payment confirmation
@@ -1715,7 +1743,7 @@ app.post('/signal', async (req,res) => {
 app.get('/health', (req,res) => {
   const users = getAllUsers();
   const trades = db.prepare('SELECT COUNT(*) as c FROM trades').get().c;
-  res.json({status:'ok', users:users.length, trades, version:'8.0', uptime:Math.floor(process.uptime())});
+  res.json({status:'ok', users:users.length, trades, version:'9.0', uptime:Math.floor(process.uptime())});
 });
 
 // ─── START ────────────────────────────────────────────────────────────────────
