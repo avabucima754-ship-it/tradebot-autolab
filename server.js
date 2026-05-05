@@ -703,7 +703,11 @@ async function processSignal(telegram_id, payload) {
       await sendTelegram(telegram_id,`🛑 <b>${strategy.name}</b>: Daily loss limit hit.`); continue;
     }
     const entryPrice = signalPrice || await fetchPrice(pair) || 0;
-    const qty = balance * (strategy.risk_per_trade_pct/100) / entryPrice;
+    if (!entryPrice) { await sendTelegram(telegram_id,`⚠️ Could not get price for ${pair}. Try again.`); continue; }
+    // Default risk 2% if not set; minimum $50 trade so P&L is visible
+    const riskPct = strategy.risk_per_trade_pct > 0 ? strategy.risk_per_trade_pct : 2;
+    const riskUsd = Math.max(balance * (riskPct/100), 50); // at least $50 worth
+    const qty = riskUsd / entryPrice;
     const tp = action==='BUY' ? entryPrice*(1+strategy.take_profit_pct/100) : entryPrice*(1-strategy.take_profit_pct/100);
     const sl = action==='BUY' ? entryPrice*(1-strategy.stop_loss_pct/100) : entryPrice*(1+strategy.stop_loss_pct/100);
     let orderId='';
@@ -958,11 +962,11 @@ Select your market:`;
       market: od.market||'crypto',
       pair: od.pair||'BTCUSDT',
       entry_type: od.entry||'signal',
-      take_profit_pct: od.tp||2,
-      stop_loss_pct: od.sl||1,
-      risk_per_trade_pct: od.risk||1,
-      max_trades_per_day: od.max_trades||5,
-      max_loss_limit_pct: od.max_loss||5,
+      take_profit_pct: parseFloat(od.tp)||3,
+      stop_loss_pct: parseFloat(od.sl)||1.5,
+      risk_per_trade_pct: parseFloat(od.risk)||2,
+      max_trades_per_day: parseInt(od.max_trades)||10,
+      max_loss_limit_pct: parseFloat(od.max_loss)||10,
       mode
     });
     updateUser(user.id, {onboarding_step:'', onboarding_data:{}});
@@ -1169,38 +1173,74 @@ ${returnEmoji} Total Return: <b>${parseFloat(totalReturn)>=0?'+':''}${totalRetur
 
   } else if (data==='demo_chart') {
     const strategies = listStrategies(chat_id).filter(s=>s.is_active);
-    const pair = strategies.length ? strategies[0].pair : 'BTCUSDT';
-    // Normalize pair for TradingView (e.g. BTCUSDT → BINANCE:BTCUSDT)
-    const tvSymbol = pair.includes(':') ? pair : `BINANCE:${pair}`;
-    const tvUrl = `https://www.tradingview.com/chart/?symbol=${tvSymbol}&interval=240`;
+    const openTrades = listTrades(chat_id, {status:'open'});
+    const pair = strategies.length ? strategies[0].pair : (openTrades.length ? openTrades[0].pair : 'BTCUSDT');
     const price = await fetchPrice(pair) || 0;
-    // Also build mini text chart from candles
     const candles = await fetch4hCandles(pair);
-    let miniChart = '';
-    if (candles.length >= 6) {
-      const last6 = candles.slice(-6);
-      const closes = last6.map(c=>c.close);
-      const pctChanges = closes.map((c,i)=> i===0 ? 0 : ((c-closes[i-1])/closes[i-1]*100));
-      miniChart = '\n\n<b>Last 6 candles (4H):</b>\n<code>';
-      pctChanges.slice(1).forEach(p => {
-        miniChart += p>=0 ? `▲ +${p.toFixed(2)}%\n` : `▼ ${p.toFixed(2)}%\n`;
-      });
-      miniChart += '</code>';
+
+    // Build candle direction summary
+    let candleText = '';
+    if (candles.length >= 8) {
+      const last8 = candles.slice(-8);
+      candleText = '\n\n📊 <b>4H Candles (newest right):</b>\n<code>';
+      last8.forEach(c => { candleText += c.close >= c.open ? '🟢' : '🔴'; });
+      candleText += '</code>\n';
+      const first = last8[0].close, last = last8[last8.length-1].close;
+      const swing = ((last-first)/first*100).toFixed(2);
+      candleText += `Trend: <b>${parseFloat(swing)>=0?'📈 UP':'📉 DOWN'} ${swing}%</b> over 8 candles`;
     }
-    const openTrades = listTrades(chat_id, {status:'open'}).filter(t=>t.pair===pair);
+
+    // Open position info
     let tradeInfo = '';
-    if (openTrades.length) {
-      const t = openTrades[0];
-      const uPnl = t.action==='BUY'?(price-t.entry_price)*t.quantity:(t.entry_price-price)*t.quantity;
-      tradeInfo = `\n\n🔴 <b>Your open position:</b>\n${t.action} @ $${fmt(t.entry_price,4)} | Now $${fmt(price,4)}\nP&L: <b>${fmtPnl(uPnl)}</b>`;
+    for (const t of openTrades) {
+      if (t.pair !== pair) continue;
+      const uPnl = t.action==='BUY' ? (price-t.entry_price)*t.quantity : (t.entry_price-price)*t.quantity;
+      const uPct = t.action==='BUY' ? ((price-t.entry_price)/t.entry_price*100) : ((t.entry_price-price)/t.entry_price*100);
+      tradeInfo += `\n\n🔴 <b>Your open ${t.action}:</b>\nEntry: $${fmt(t.entry_price,4)} → Now: $${fmt(price,4)}\nP&L: <b>${fmtPnl(uPnl)}</b> (${uPct>=0?'+':''}${uPct.toFixed(2)}%)\n🎯 TP: $${fmt(t.take_profit,4)} | 🛡️ SL: $${fmt(t.stop_loss,4)}`;
     }
-    await sendTelegram(chat_id,
-      `📊 <b>${pair} Chart</b>\n──────────────────────────\n💵 Current Price: <b>$${fmt(price,4)}</b>${miniChart}${tradeInfo}\n\n📈 <b>View full interactive chart:</b>\n${tvUrl}`,
-      {inline_keyboard:[
-        [{text:'🔄 Refresh',callback_data:'demo_chart'}],
-        [{text:'📈 BUY Now',callback_data:'demo_quick_buy'},{text:'📉 SELL Now',callback_data:'demo_quick_sell'}],
-        [{text:'🧪 Dashboard',callback_data:'menu_paper'},{text:'🏠 Menu',callback_data:'menu_main'}]
-      ]});
+
+    // Send photo chart via Binance chart image then fallback text
+    const sym = pair.replace('USDT','').toUpperCase();
+    // Use mermaidchart/quickchart for a real image — send as photo
+    let chartSent = false;
+    try {
+      // CryptoCompare chart image
+      const chartImgUrl = `https://min-api.cryptocompare.com/data/v2/histohour?fsym=${sym}&tsym=USD&limit=24&aggregate=4`;
+      // Use finviz-style image from coingecko widgets
+      const widgetUrl = `https://www.coingecko.com/en/coins/${sym.toLowerCase()}/embed?locale=en`;
+      // Best option: send Binance chart screenshot via quickchart
+      const chartUrl = `https://quickchart.io/chart?width=600&height=300&c=${encodeURIComponent(JSON.stringify({
+        type:'line',
+        data:{
+          labels: candles.slice(-24).map((_,i)=>`${i*4}h`),
+          datasets:[{label:pair,data:candles.slice(-24).map(c=>c.close),borderColor:'#00ff88',backgroundColor:'rgba(0,255,136,0.1)',fill:true,tension:0.3,pointRadius:0}]
+        },
+        options:{scales:{x:{display:false},y:{ticks:{callback:'function(v){return "$"+v.toLocaleString()}'}}},plugins:{legend:{display:false}},backgroundColor:'#1a1a2e'}
+      }))}`;
+      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({chat_id, photo: chartUrl, caption: `📊 <b>${pair}</b> — 24H Price Chart
+💵 Now: $${fmt(price,4)}${tradeInfo}`, parse_mode:'HTML',
+          reply_markup:{inline_keyboard:[
+            [{text:'🔄 Refresh Chart',callback_data:'demo_chart'}],
+            [{text:'📈 BUY Now',callback_data:'demo_quick_buy'},{text:'📉 SELL Now',callback_data:'demo_quick_sell'}],
+            [{text:'🧪 Dashboard',callback_data:'menu_paper'},{text:'🏠 Main Menu',callback_data:'menu_main'}]
+          ]}})
+      });
+      chartSent = true;
+    } catch(e) { console.error('Chart photo failed:', e.message); }
+
+    if (!chartSent) {
+      // Fallback text chart
+      await sendTelegram(chat_id,
+        `📊 <b>${pair} Market</b>\n──────────────────────────\n💵 Price: <b>$${fmt(price,4)}</b>${candleText}${tradeInfo}\n\n🔗 Full chart: https://www.tradingview.com/symbols/${sym}USDT/`,
+        {inline_keyboard:[
+          [{text:'🔄 Refresh',callback_data:'demo_chart'}],
+          [{text:'📈 BUY Now',callback_data:'demo_quick_buy'},{text:'📉 SELL Now',callback_data:'demo_quick_sell'}],
+          [{text:'🧪 Dashboard',callback_data:'menu_paper'},{text:'🏠 Menu',callback_data:'menu_main'}]
+        ]});
+    }
 
   } else if (data==='demo_history') {
     const allTrades = listTrades(chat_id, {mode:'paper'}).filter(t=>t.status==='closed').slice(-10).reverse();
@@ -1650,7 +1690,7 @@ const app = express();
 app.use(express.json());
 
 app.get('/', (req,res) => {
-  res.json({status:'TradeBot AutoLab v5.0 🤖', version:'9.0', uptime:`${Math.floor(process.uptime())}s`, time:new Date().toISOString()});
+  res.json({status:'TradeBot AutoLab v5.0 🤖', version:'10.0', uptime:`${Math.floor(process.uptime())}s`, time:new Date().toISOString()});
 });
 
 // Stripe webhook for payment confirmation
@@ -1743,7 +1783,7 @@ app.post('/signal', async (req,res) => {
 app.get('/health', (req,res) => {
   const users = getAllUsers();
   const trades = db.prepare('SELECT COUNT(*) as c FROM trades').get().c;
-  res.json({status:'ok', users:users.length, trades, version:'9.0', uptime:Math.floor(process.uptime())});
+  res.json({status:'ok', users:users.length, trades, version:'10.0', uptime:Math.floor(process.uptime())});
 });
 
 // ─── START ────────────────────────────────────────────────────────────────────
