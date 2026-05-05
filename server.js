@@ -839,7 +839,8 @@ async function handleCallback(callback) {
   await answerCallback(callback.id);
   let user = getUser(chat_id);
   if (!user) user = createUser({telegram_id:chat_id, telegram_username:callback.from?.username||'', first_name:callback.from?.first_name||''});
-  const od = user.onboarding_data||{};
+  const getOd = () => { const u = getUser(chat_id); return u?.onboarding_data||{}; };
+  let od = getOd();
 
   // ── Main menu ──
   if (data==='menu_main') {
@@ -864,7 +865,7 @@ Select your market:`;
 
   } else if (['market_crypto','market_forex','market_stocks'].includes(data)) {
     const market = data.replace('market_','');
-    updateUser(user.id, {onboarding_data:{...od,market}, onboarding_step:'select_pair'}); od = getOd();
+    updateUser(user.id, {onboarding_data:{...od,market}, onboarding_step:'select_pair'}); od = getOd(); od = getOd();
     const pairs = market==='crypto'?[
       ['BTCUSDT','ETHUSDT'],['BNBUSDT','SOLUSDT'],['XRPUSDT','DOGEUSDT'],['Other (type it)','']
     ] : market==='forex'?[
@@ -887,7 +888,7 @@ Select your market:`;
       await sendTelegram(chat_id, '✍️ Type your pair (e.g. BTCUSDT, AAPL):');
       return;
     }
-    updateUser(user.id, {onboarding_data:{...od,pair}, onboarding_step:'select_entry'}); od = getOd();
+    updateUser(user.id, {onboarding_data:{...od,pair}, onboarding_step:'select_entry'}); od = getOd(); od = getOd();
     await sendTelegram(chat_id, `✅ Pair: <b>${pair}</b>\n\n📋 <b>Select entry type:</b>`, {inline_keyboard:[
       [{text:'📡 TradingView Signal',callback_data:'entry_signal'},{text:'🔔 Price Alert',callback_data:'entry_alert'}],
       [{text:'🤖 Auto (AI)',callback_data:'entry_ai'}],
@@ -896,7 +897,7 @@ Select your market:`;
 
   } else if (data.startsWith('entry_')) {
     const entry = data.replace('entry_','');
-    updateUser(user.id, {onboarding_data:{...od,entry}, onboarding_step:'await_tp'}); od = getOd();
+    updateUser(user.id, {onboarding_data:{...od,entry}, onboarding_step:'await_tp'}); od = getOd(); od = getOd();
     await sendTelegram(chat_id, `✅ Entry: <b>${entry.toUpperCase()}</b>\n\n🎯 <b>Take Profit %</b>\n(e.g. 3 means +3% from entry):`);
 
   } else if (data.startsWith('set_mode_')) {
@@ -1035,6 +1036,18 @@ ${demoActive
         backToMenu());
     }
     return;
+
+  } else if (data==='test_paper_trade') {
+    const paperStrats = listStrategies(chat_id).filter(s=>s.mode==='paper'&&s.is_active);
+    if (!paperStrats.length) {
+      await sendTelegram(chat_id,
+        `⚠️ <b>No Active Paper Strategy</b>\n──────────────────────────\nYou need to create a paper trading strategy first!\n\nTap Create Strategy, set mode to Paper, and come back.`,
+        {inline_keyboard:[[{text:'🤖 Create Strategy',callback_data:'menu_create'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
+      return;
+    }
+    const strat = paperStrats[0];
+    await sendTelegram(chat_id, `🔥 <b>Firing test BUY on "${strat.name}" (${strat.pair})...</b>`);
+    await processSignal(chat_id, {pair: strat.pair, action:'BUY', price:null});
 
   } else if (data==='close_all_paper') {
     const trades = listTrades(chat_id, {mode:'paper', status:'open'});
@@ -1531,6 +1544,17 @@ app.get('/signal', async (req,res) => {
   const payload = {pair, action, price: parseFloat(req.query.price||0)||null};
   res.json({ok:true, received: payload, message:'Signal processing...'});
   try { await processSignal(telegram_id, payload); } catch(e) { console.error('Signal GET error:', e.message); }
+});
+
+app.get('/signal', async (req,res) => {
+  const telegram_id = req.query.user_id || req.query.telegram_id;
+  if (!telegram_id) return res.status(400).json({error:'user_id required'});
+  const pair = (req.query.pair||'').toUpperCase();
+  const action = (req.query.action||'BUY').toUpperCase();
+  if (!pair) return res.status(400).json({error:'pair required'});
+  const payload = {pair, action, price: parseFloat(req.query.price||0)||null};
+  res.json({ok:true, received: payload, message:'Signal queued!'});
+  try { await processSignal(telegram_id, payload); } catch(e) { console.error('Signal GET:', e.message); }
 });
 
 app.post('/signal', async (req,res) => {
