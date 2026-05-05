@@ -252,6 +252,15 @@ function closeTrade(id, exit_price, close_reason) {
   db.prepare(`UPDATE trades SET status='closed',exit_price=?,pnl=?,pnl_pct=?,close_reason=?,updated_date=datetime('now') WHERE id=?`).run(exit_price,pnl,pnl_pct,close_reason,id);
   const strategy = db.prepare('SELECT * FROM strategies WHERE id=?').get(t.strategy_id);
   if (strategy) db.prepare(`UPDATE strategies SET total_trades=total_trades+1,total_wins=total_wins+?,total_pnl=total_pnl+?,updated_date=datetime('now') WHERE id=?`).run(pnl>0?1:0,pnl,t.strategy_id);
+  // Update demo_balance when paper trade closes
+  if (t.mode==='paper') {
+    const u = db.prepare('SELECT * FROM bot_users WHERE telegram_id=?').get(t.telegram_id);
+    if (u && (u.demo_balance>0||u.balance_usd>0)) {
+      const current = u.demo_balance>0?u.demo_balance:u.balance_usd;
+      const newBalance = Math.max(0, current + pnl);
+      db.prepare('UPDATE bot_users SET demo_balance=?,balance_usd=?,updated_date=datetime('now') WHERE telegram_id=?').run(newBalance,newBalance,t.telegram_id);
+    }
+  }
   return {...t,exit_price,pnl,pnl_pct,close_reason,status:'closed'};
 }
 function getTodayTradeCount(telegram_id, strategy_id) {
@@ -553,7 +562,9 @@ async function assertWebhook() {
 }
 
 // ─── TRADE MONITOR (paper TP/SL check) ───────────────────────────────────────
+let monitorTickCount = 0;
 async function monitorTrades() {
+  monitorTickCount++;
   try {
     const openTrades = db.prepare(`SELECT * FROM trades WHERE status='open'`).all(); // monitor ALL modes
     for (const t of openTrades) {
@@ -582,6 +593,36 @@ ${emoji} <b>Trade Closed — ${reason}</b>
 ──────────────────────────
 ${result.pnl>0?'🏆 Profitable trade! Well done.':'💪 Stop loss protected your capital.'}`;
         await sendTelegram(t.telegram_id, msg, {inline_keyboard:[[{text:'📊 Performance',callback_data:'menu_performance'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
+      }
+    }
+    // Every 10 ticks (5 min) — send live P&L update for users with open demo trades
+    if (monitorTickCount % 10 === 0 && openTrades.length) {
+      const byUser = {};
+      for (const t of openTrades) {
+        if (!byUser[t.telegram_id]) byUser[t.telegram_id]=[];
+        byUser[t.telegram_id].push(t);
+      }
+      for (const [uid, userTrades] of Object.entries(byUser)) {
+        const paperTrades = userTrades.filter(t=>t.mode==='paper');
+        if (!paperTrades.length) continue;
+        let totalUnreal = 0;
+        let lines = '';
+        for (const t of paperTrades) {
+          const cur = await fetchPrice(t.pair)||t.entry_price;
+          const uPnl = t.action==='BUY'?(cur-t.entry_price)*t.quantity:(t.entry_price-cur)*t.quantity;
+          const uPct = t.action==='BUY'?((cur-t.entry_price)/t.entry_price*100):((t.entry_price-cur)/t.entry_price*100);
+          totalUnreal += uPnl;
+          const emoji = uPnl>=0?'📈':'📉';
+          lines += `${emoji} <b>${t.pair}</b> ${t.action}: ${fmtPnl(uPnl)} (${uPct>=0?'+':''}${uPct.toFixed(2)}%) | Now $${fmt(cur,4)}\n`;
+        }
+        const u = getUser(uid);
+        const bal = (u?.demo_balance>0?u.demo_balance:null)||u?.balance_usd||10000;
+        await sendTelegram(uid,
+          `📊 <b>Live Demo Update</b>\n──────────────────────────\n${lines}\n💼 Portfolio: <b>$${fmt(bal+totalUnreal)}</b> | Unrealized: <b>${fmtPnl(totalUnreal)}</b>`,
+          {inline_keyboard:[
+            [{text:'📊 Dashboard',callback_data:'menu_paper'},{text:'❌ Close All',callback_data:'close_all_paper'}],
+            [{text:'📉 Chart',callback_data:'demo_chart'},{text:'🏠 Menu',callback_data:'menu_main'}]
+          ]});
       }
     }
   } catch(e) { console.error('Monitor:', e.message); }
@@ -1049,6 +1090,70 @@ ${demoActive
     await sendTelegram(chat_id, `🔥 <b>Firing test BUY on "${strat.name}" (${strat.pair})...</b>`);
     await processSignal(chat_id, {pair: strat.pair, action:'BUY', price:null});
 
+  } else if (data==='demo_quick_buy'||data==='demo_quick_sell') {
+    const action = data==='demo_quick_buy'?'BUY':'SELL';
+    const strategies = listStrategies(chat_id).filter(s=>s.mode==='paper'&&s.is_active);
+    if (!strategies.length) {
+      await sendTelegram(chat_id,
+        `⚠️ <b>No Paper Strategy</b>\n──────────────────────────\nCreate a paper strategy first to start trading!`,
+        {inline_keyboard:[[{text:'🤖 Create Strategy',callback_data:'menu_create'}]]});
+      return;
+    }
+    if (strategies.length===1) {
+      const s = strategies[0];
+      await sendTelegram(chat_id, `⏳ Opening ${action} on <b>${s.name}</b> (${s.pair})...`);
+      await processSignal(chat_id, {pair:s.pair, action, price:null});
+      return;
+    }
+    // Multiple strategies — let user pick
+    const kb = {inline_keyboard: strategies.slice(0,6).map(s=>[{text:`${action==='BUY'?'📈':'📉'} ${s.name} (${s.pair})`,callback_data:`demo_fire_${action}_${s.id.slice(-8)}`}])};
+    kb.inline_keyboard.push([{text:'🏠 Menu',callback_data:'menu_main'}]);
+    await sendTelegram(chat_id, `📋 <b>Pick strategy to ${action}:</b>`, kb);
+
+  } else if (data.startsWith('demo_fire_')) {
+    const parts = data.split('_');
+    const action = parts[2];
+    const stratSuffix = parts[3];
+    const strategies = listStrategies(chat_id);
+    const s = strategies.find(st=>st.id.endsWith(stratSuffix));
+    if (!s) { await sendTelegram(chat_id,'❌ Strategy not found.', backToMenu()); return; }
+    await sendTelegram(chat_id, `⏳ Opening <b>${action}</b> on ${s.name} (${s.pair})...`);
+    await processSignal(chat_id, {pair:s.pair, action, price:null});
+
+  } else if (data==='demo_chart') {
+    // Show chart for user's first active paper strategy pair
+    const strategies = listStrategies(chat_id).filter(s=>s.mode==='paper'&&s.is_active);
+    const pair = strategies.length?strategies[0].pair:'BTCUSDT';
+    await sendTelegram(chat_id, `📉 <b>Fetching chart for ${pair}...</b>`);
+    const price = await fetchPrice(pair)||0;
+    const candles = await fetch4hCandles(pair);
+    const chart = renderChart(candles, pair, price);
+    await sendTelegram(chat_id, chart,
+      {inline_keyboard:[
+        [{text:'🔄 Refresh',callback_data:'demo_chart'},{text:'📈 BUY',callback_data:'demo_quick_buy'},{text:'📉 SELL',callback_data:'demo_quick_sell'}],
+        [{text:'🧪 Demo Dashboard',callback_data:'menu_paper'},{text:'🏠 Menu',callback_data:'menu_main'}]
+      ]});
+
+  } else if (data==='demo_history') {
+    const allTrades = listTrades(chat_id, {mode:'paper'}).filter(t=>t.status==='closed').slice(-10).reverse();
+    if (!allTrades.length) {
+      await sendTelegram(chat_id,'📋 <b>No closed trades yet.</b>\nTrades will appear here after they close.', backToMenu());
+      return;
+    }
+    let msg = `📋 <b>Trade History (Last ${allTrades.length})</b>\n══════════════════════════\n`;
+    for (const t of allTrades) {
+      const emoji = (t.pnl||0)>=0?'🟢':'🔴';
+      msg += `${emoji} <b>${t.pair}</b> ${t.action}\n`;
+      msg += `   Entry: $${fmt(t.entry_price,4)} → Exit: $${fmt(t.exit_price||0,4)}\n`;
+      msg += `   P&L: <b>${fmtPnl(t.pnl||0)}</b> (${(t.pnl_pct||0)>=0?'+':''}${(t.pnl_pct||0).toFixed(2)}%) [${t.close_reason||'manual'}]\n`;
+      msg += `   ⏱️ ${new Date(t.created_date).toLocaleDateString()}\n`;
+      msg += `──────────────────────────\n`;
+    }
+    await sendTelegram(chat_id, msg, {inline_keyboard:[
+      [{text:'📈 Open New Trade',callback_data:'demo_quick_buy'},{text:'🧪 Dashboard',callback_data:'menu_paper'}],
+      [{text:'🏠 Menu',callback_data:'menu_main'}]
+    ]});
+
   } else if (data==='close_all_paper') {
     const trades = listTrades(chat_id, {mode:'paper', status:'open'});
     let closed=0;
@@ -1477,7 +1582,7 @@ const app = express();
 app.use(express.json());
 
 app.get('/', (req,res) => {
-  res.json({status:'TradeBot AutoLab v5.0 🤖', version:'6.0', uptime:`${Math.floor(process.uptime())}s`, time:new Date().toISOString()});
+  res.json({status:'TradeBot AutoLab v5.0 🤖', version:'7.0', uptime:`${Math.floor(process.uptime())}s`, time:new Date().toISOString()});
 });
 
 // Stripe webhook for payment confirmation
@@ -1570,7 +1675,7 @@ app.post('/signal', async (req,res) => {
 app.get('/health', (req,res) => {
   const users = getAllUsers();
   const trades = db.prepare('SELECT COUNT(*) as c FROM trades').get().c;
-  res.json({status:'ok', users:users.length, trades, version:'6.0', uptime:Math.floor(process.uptime())});
+  res.json({status:'ok', users:users.length, trades, version:'7.0', uptime:Math.floor(process.uptime())});
 });
 
 // ─── START ────────────────────────────────────────────────────────────────────
