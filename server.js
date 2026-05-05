@@ -258,7 +258,7 @@ function closeTrade(id, exit_price, close_reason) {
     if (u && (u.demo_balance>0||u.balance_usd>0)) {
       const current = u.demo_balance>0?u.demo_balance:u.balance_usd;
       const newBalance = Math.max(0, current + pnl);
-      db.prepare('UPDATE bot_users SET demo_balance=?,balance_usd=?,updated_date=datetime('now') WHERE telegram_id=?').run(newBalance,newBalance,t.telegram_id);
+      db.prepare(`UPDATE bot_users SET demo_balance=?,balance_usd=?,updated_date=datetime('now') WHERE telegram_id=?`).run(newBalance,newBalance,t.telegram_id);
     }
   }
   return {...t,exit_price,pnl,pnl_pct,close_reason,status:'closed'};
