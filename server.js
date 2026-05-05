@@ -391,21 +391,70 @@ function backAndMenu(back_data, back_label='« Back') {
 
 // ─── PRICE FETCH ─────────────────────────────────────────────────────────────
 const priceCache = {};
+// coin name map for APIs that need full name
+const COIN_NAMES = {BTC:'bitcoin',ETH:'ethereum',BNB:'binancecoin',SOL:'solana',XRP:'ripple',ADA:'cardano',DOGE:'dogecoin',DOT:'polkadot',MATIC:'matic-network',AVAX:'avalanche-2',LINK:'chainlink',LTC:'litecoin',UNI:'uniswap',ATOM:'cosmos',FTM:'fantom',NEAR:'near',APT:'aptos',ARB:'arbitrum',OP:'optimism',SUI:'sui',TON:'the-open-network',SHIB:'shiba-inu',PEPE:'pepe',TRX:'tron',XLM:'stellar'};
+const KRAKEN_MAP = {BTC:'XBT',DOGE:'XDG'};
+
 async function fetchPrice(symbol) {
   const sym = symbol.replace('/','').toUpperCase();
+  const base = sym.replace('USDT','').replace('USD','');
   const now = Date.now();
-  if (priceCache[sym] && now - priceCache[sym].ts < 10000) return priceCache[sym].price;
+  if (priceCache[sym] && now - priceCache[sym].ts < 8000) return priceCache[sym].price;
+  const cache = (p) => { if (p && p > 0) { priceCache[sym]={price:p,ts:now}; return p; } return null; };
+
+  // 1. Bybit (most reliable on cloud IPs)
   try {
-    const r = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${sym}`);
+    const r = await fetch(`https://api.bybit.com/v5/market/tickers?category=spot&symbol=${base}USDT`, {signal: AbortSignal.timeout(4000)});
     const d = await r.json();
-    if (d.price) { priceCache[sym] = {price: parseFloat(d.price), ts: now}; return parseFloat(d.price); }
+    const p = parseFloat(d?.result?.list?.[0]?.lastPrice);
+    if (p > 0) return cache(p);
   } catch(_) {}
+
+  // 2. OKX
   try {
-    const r2 = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${sym.replace('USDT','').toLowerCase()}&vs_currencies=usd`);
-    const d2 = await r2.json();
-    const keys = Object.keys(d2);
-    if (keys.length) { const p=d2[keys[0]].usd; priceCache[sym]={price:p,ts:now}; return p; }
+    const r = await fetch(`https://www.okx.com/api/v5/market/ticker?instId=${base}-USDT`, {signal: AbortSignal.timeout(4000)});
+    const d = await r.json();
+    const p = parseFloat(d?.data?.[0]?.last);
+    if (p > 0) return cache(p);
   } catch(_) {}
+
+  // 3. Kraken
+  try {
+    const kb = KRAKEN_MAP[base] || base;
+    const r = await fetch(`https://api.kraken.com/0/public/Ticker?pair=${kb}USD`, {signal: AbortSignal.timeout(4000)});
+    const d = await r.json();
+    const vals = Object.values(d?.result || {});
+    const p = parseFloat(vals[0]?.c?.[0]);
+    if (p > 0) return cache(p);
+  } catch(_) {}
+
+  // 4. CoinCap
+  try {
+    const coinId = COIN_NAMES[base] || base.toLowerCase();
+    const r = await fetch(`https://api.coincap.io/v2/assets/${coinId}`, {signal: AbortSignal.timeout(4000)});
+    const d = await r.json();
+    const p = parseFloat(d?.data?.priceUsd);
+    if (p > 0) return cache(p);
+  } catch(_) {}
+
+  // 5. CoinGecko (rate limited but works)
+  try {
+    const coinId = COIN_NAMES[base] || base.toLowerCase();
+    const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd`, {signal: AbortSignal.timeout(5000)});
+    const d = await r.json();
+    const p = d?.[coinId]?.usd;
+    if (p > 0) return cache(p);
+  } catch(_) {}
+
+  // 6. Binance (last — geo-blocked on some servers but worth trying)
+  try {
+    const r = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${base}USDT`, {signal: AbortSignal.timeout(4000)});
+    const d = await r.json();
+    const p = parseFloat(d?.price);
+    if (p > 0) return cache(p);
+  } catch(_) {}
+
+  console.error(`[PRICE] All sources failed for ${sym}`);
   return null;
 }
 
@@ -1690,7 +1739,7 @@ const app = express();
 app.use(express.json());
 
 app.get('/', (req,res) => {
-  res.json({status:'TradeBot AutoLab v5.0 🤖', version:'10.0', uptime:`${Math.floor(process.uptime())}s`, time:new Date().toISOString()});
+  res.json({status:'TradeBot AutoLab v5.0 🤖', version:'11.0', uptime:`${Math.floor(process.uptime())}s`, time:new Date().toISOString()});
 });
 
 // Stripe webhook for payment confirmation
@@ -1783,7 +1832,7 @@ app.post('/signal', async (req,res) => {
 app.get('/health', (req,res) => {
   const users = getAllUsers();
   const trades = db.prepare('SELECT COUNT(*) as c FROM trades').get().c;
-  res.json({status:'ok', users:users.length, trades, version:'10.0', uptime:Math.floor(process.uptime())});
+  res.json({status:'ok', users:users.length, trades, version:'11.0', uptime:Math.floor(process.uptime())});
 });
 
 // ─── START ────────────────────────────────────────────────────────────────────
