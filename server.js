@@ -555,7 +555,7 @@ async function assertWebhook() {
 // ─── TRADE MONITOR (paper TP/SL check) ───────────────────────────────────────
 async function monitorTrades() {
   try {
-    const openTrades = db.prepare(`SELECT * FROM trades WHERE status='open' AND mode='paper'`).all();
+    const openTrades = db.prepare(`SELECT * FROM trades WHERE status='open'`).all(); // monitor ALL modes
     for (const t of openTrades) {
       const cur = await fetchPrice(t.pair);
       if (!cur) continue;
@@ -708,7 +708,9 @@ async function placeOrder(user, strategy, pair, action, qty) {
 
 // ─── ONBOARDING FSM ──────────────────────────────────────────────────────────
 async function handleOnboarding(chat_id, user, step, text) {
-  const od = user.onboarding_data||{};
+  // Always read fresh onboarding_data to avoid stale state bugs
+  const getOd = () => { const u = getUser(chat_id); return u?.onboarding_data||{}; };
+  let od = getOd();
   if (step==='await_tp') {
     const tp=parseFloat(text);
     if (isNaN(tp)||tp<=0||tp>100){await sendTelegram(chat_id,'❌ Enter a valid Take Profit % (e.g. 3):');return;}
@@ -862,7 +864,7 @@ Select your market:`;
 
   } else if (['market_crypto','market_forex','market_stocks'].includes(data)) {
     const market = data.replace('market_','');
-    updateUser(user.id, {onboarding_data:{...od,market}, onboarding_step:'select_pair'});
+    updateUser(user.id, {onboarding_data:{...od,market}, onboarding_step:'select_pair'}); od = getOd();
     const pairs = market==='crypto'?[
       ['BTCUSDT','ETHUSDT'],['BNBUSDT','SOLUSDT'],['XRPUSDT','DOGEUSDT'],['Other (type it)','']
     ] : market==='forex'?[
@@ -885,7 +887,7 @@ Select your market:`;
       await sendTelegram(chat_id, '✍️ Type your pair (e.g. BTCUSDT, AAPL):');
       return;
     }
-    updateUser(user.id, {onboarding_data:{...od,pair}, onboarding_step:'select_entry'});
+    updateUser(user.id, {onboarding_data:{...od,pair}, onboarding_step:'select_entry'}); od = getOd();
     await sendTelegram(chat_id, `✅ Pair: <b>${pair}</b>\n\n📋 <b>Select entry type:</b>`, {inline_keyboard:[
       [{text:'📡 TradingView Signal',callback_data:'entry_signal'},{text:'🔔 Price Alert',callback_data:'entry_alert'}],
       [{text:'🤖 Auto (AI)',callback_data:'entry_ai'}],
@@ -894,7 +896,7 @@ Select your market:`;
 
   } else if (data.startsWith('entry_')) {
     const entry = data.replace('entry_','');
-    updateUser(user.id, {onboarding_data:{...od,entry}, onboarding_step:'await_tp'});
+    updateUser(user.id, {onboarding_data:{...od,entry}, onboarding_step:'await_tp'}); od = getOd();
     await sendTelegram(chat_id, `✅ Entry: <b>${entry.toUpperCase()}</b>\n\n🎯 <b>Take Profit %</b>\n(e.g. 3 means +3% from entry):`);
 
   } else if (data.startsWith('set_mode_')) {
@@ -936,7 +938,7 @@ Select your market:`;
 
 Use this in TradingView alerts!`;
     await sendTelegram(chat_id, msg, {inline_keyboard:[
-      [{text:'📡 Signal Guide',callback_data:'menu_signal'},{text:'🧪 Test Paper Trade',callback_data:'menu_paper'}],
+      [{text:'📡 Signal Guide',callback_data:'menu_signal'},{text:'🧪 Fire Test Trade',callback_data:'test_paper_trade'}],
       [{text:'🏠 Main Menu',callback_data:'menu_main'}]
     ]});
 
@@ -1014,6 +1016,25 @@ ${demoActive
     await sendTelegram(chat_id,
       `🔄 <b>Demo Account Reset</b>\n──────────────────────────\n✅ Demo balance cleared. Virtual balance restored to $10,000.\n\nTap <b>Add Demo Funds</b> to start fresh with your own amount.`,
       {inline_keyboard:[[{text:'💰 Add Demo Funds',callback_data:'demo_add_funds'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
+
+  } else if (data==='test_paper_trade') {
+    // Fire a real test BUY signal on user's first paper strategy
+    const paperStrats = listStrategies(chat_id).filter(s=>s.mode==='paper'&&s.is_active);
+    if (!paperStrats.length) {
+      await sendTelegram(chat_id,
+        `⚠️ <b>No Paper Strategy Found</b>\n──────────────────────────\nCreate a paper trading strategy first, then come back to test it!`,
+        {inline_keyboard:[[{text:'🤖 Create Strategy',callback_data:'menu_create'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
+      return;
+    }
+    const strat = paperStrats[0];
+    await sendTelegram(chat_id, `⏳ <b>Firing test trade on "${strat.name}"...</b>`);
+    const result = await processSignal(chat_id, {pair: strat.pair, action:'BUY', price:null});
+    if (result.matched===0) {
+      await sendTelegram(chat_id,
+        `❌ <b>Test signal fired but no trade opened.</b>\nCheck your strategy is active and the pair is valid.`,
+        backToMenu());
+    }
+    return;
 
   } else if (data==='close_all_paper') {
     const trades = listTrades(chat_id, {mode:'paper', status:'open'});
@@ -1443,7 +1464,7 @@ const app = express();
 app.use(express.json());
 
 app.get('/', (req,res) => {
-  res.json({status:'TradeBot AutoLab v5.0 🤖', version:'5.0', uptime:`${Math.floor(process.uptime())}s`, time:new Date().toISOString()});
+  res.json({status:'TradeBot AutoLab v5.0 🤖', version:'6.0', uptime:`${Math.floor(process.uptime())}s`, time:new Date().toISOString()});
 });
 
 // Stripe webhook for payment confirmation
@@ -1500,6 +1521,18 @@ app.post('/webhook', async (req,res) => {
 });
 
 // Signal webhook (TradingView)
+// GET signal — for browser testing and simple webhooks
+app.get('/signal', async (req,res) => {
+  const telegram_id = req.query.user_id || req.query.telegram_id;
+  if (!telegram_id) return res.status(400).json({error:'user_id required'});
+  const pair = (req.query.pair||'').toUpperCase();
+  const action = (req.query.action||'').toUpperCase();
+  if (!pair||!action) return res.status(400).json({error:'pair and action required'});
+  const payload = {pair, action, price: parseFloat(req.query.price||0)||null};
+  res.json({ok:true, received: payload, message:'Signal processing...'});
+  try { await processSignal(telegram_id, payload); } catch(e) { console.error('Signal GET error:', e.message); }
+});
+
 app.post('/signal', async (req,res) => {
   const telegram_id = req.query.user_id || req.query.telegram_id;
   if (!telegram_id) return res.status(400).json({error:'user_id required'});
@@ -1513,7 +1546,7 @@ app.post('/signal', async (req,res) => {
 app.get('/health', (req,res) => {
   const users = getAllUsers();
   const trades = db.prepare('SELECT COUNT(*) as c FROM trades').get().c;
-  res.json({status:'ok', users:users.length, trades, version:'5.0', uptime:Math.floor(process.uptime())});
+  res.json({status:'ok', users:users.length, trades, version:'6.0', uptime:Math.floor(process.uptime())});
 });
 
 // ─── START ────────────────────────────────────────────────────────────────────
