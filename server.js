@@ -979,10 +979,17 @@ Select your market:`;
 <code>${signalUrl}</code>
 
 Use this in TradingView alerts!`;
-    await sendTelegram(chat_id, msg, {inline_keyboard:[
-      [{text:'📡 Signal Guide',callback_data:'menu_signal'},{text:'🧪 Fire Test Trade',callback_data:'test_paper_trade'}],
-      [{text:'🏠 Main Menu',callback_data:'menu_main'}]
-    ]});
+    if (mode==='paper') {
+      await sendTelegram(chat_id, msg, {inline_keyboard:[
+        [{text:'📈 BUY Now',callback_data:'demo_quick_buy'},{text:'📉 SELL Now',callback_data:'demo_quick_sell'}],
+        [{text:'📊 Demo Dashboard',callback_data:'menu_paper'},{text:'🏠 Menu',callback_data:'menu_main'}]
+      ]});
+    } else {
+      await sendTelegram(chat_id, msg, {inline_keyboard:[
+        [{text:'📡 Signal Guide',callback_data:'menu_signal'},{text:'📊 Dashboard',callback_data:'menu_paper'}],
+        [{text:'🏠 Main Menu',callback_data:'menu_main'}]
+      ]});
+    }
 
   // ── Signal setup ──
   } else if (data==='menu_signal') {
@@ -1007,43 +1014,88 @@ Use this in TradingView alerts!`;
 
   // ── Paper trading ──
   } else if (data==='menu_paper') {
-    const trades = listTrades(chat_id, {mode:'paper', status:'open'});
-    const closed = listTrades(chat_id, {mode:'paper'}).filter(t=>t.status==='closed');
-    const pnl = closed.reduce((s,t)=>s+t.pnl,0);
-    const demoActive = (user.demo_balance||0) > 0;
-    const demoBalance = user.demo_balance||0;
-    const demoInitial = user.demo_initial||0;
-    const demoReturn = demoInitial>0 ? ((demoBalance-demoInitial)/demoInitial*100).toFixed(2) : '0.00';
-    let msg = `
-🧪 <b>Paper Trading</b>
+    // ── FULL DEMO TRADING DASHBOARD ──
+    const openTrades = listTrades(chat_id, {mode:'paper', status:'open'});
+    const allPaper   = listTrades(chat_id, {mode:'paper'});
+    const closed     = allPaper.filter(t=>t.status==='closed');
+    const demoBalance  = user.demo_balance>0 ? user.demo_balance : (user.balance_usd||10000);
+    const demoInitial  = user.demo_initial>0  ? user.demo_initial : demoBalance;
+    const realizedPnl  = closed.reduce((s,t)=>s+(t.pnl||0),0);
+    const wins         = closed.filter(t=>(t.pnl||0)>0).length;
+    const winRate      = closed.length ? ((wins/closed.length)*100).toFixed(0) : 0;
+    const totalReturn  = ((demoBalance - demoInitial)/demoInitial*100).toFixed(2);
+    const returnEmoji  = parseFloat(totalReturn)>=0?'📈':'📉';
+    const strategies   = listStrategies(chat_id).filter(s=>s.mode==='paper'&&s.is_active);
+
+    // Fetch live prices and compute unrealized P&L
+    let unrealized = 0;
+    const posLines = [];
+    for (const t of openTrades.slice(0,5)) {
+      const cur  = await fetchPrice(t.pair) || t.entry_price;
+      const uPnl = t.action==='BUY' ? (cur-t.entry_price)*t.quantity : (t.entry_price-cur)*t.quantity;
+      const uPct = t.action==='BUY' ? ((cur-t.entry_price)/t.entry_price*100) : ((t.entry_price-cur)/t.entry_price*100);
+      unrealized += uPnl;
+      const tpDist = t.action==='BUY' ? ((t.take_profit-cur)/cur*100) : ((cur-t.take_profit)/cur*100);
+      const slDist = t.action==='BUY' ? ((cur-t.stop_loss)/cur*100)   : ((t.stop_loss-cur)/cur*100);
+      const pEmoji = uPnl>=0?'🟢':'🔴';
+      posLines.push(
+        `${pEmoji} <b>${t.pair}</b> ${t.action}  |  ⏱️ ${tradeTimer(t)}\n` +
+        `   Entry: $${fmt(t.entry_price,4)}  →  Now: $${fmt(cur,4)}\n` +
+        `   P&L: <b>${fmtPnl(uPnl)}</b> (${uPct>=0?'+':''}${uPct.toFixed(2)}%)\n` +
+        `   🎯 TP $${fmt(t.take_profit,4)} (${tpDist>0?'+':''}${tpDist.toFixed(2)}% away)\n` +
+        `   🛡️ SL $${fmt(t.stop_loss,4)} (-${Math.abs(slDist).toFixed(2)}% away)\n` +
+        `   [<code>close_${t.id.slice(-8)}</code>]`
+      );
+    }
+
+    const portfolioValue = demoBalance + unrealized;
+
+    let msg =
+`🧪 <b>DEMO ACCOUNT</b>
+══════════════════════════
+💰 Cash Balance:   <b>$${fmt(demoBalance)}</b>
+📊 Unrealized P&L: <b>${fmtPnl(unrealized)}</b>
+💼 Portfolio:      <b>$${fmt(portfolioValue)}</b>
 ──────────────────────────
-${demoActive
-  ? `💰 Demo Balance: <b>$${fmt(demoBalance)}</b>
-📈 Starting Capital: <b>$${fmt(demoInitial)}</b>
-📊 Total Return: <b>${demoReturn >= 0 ? '+':''}${demoReturn}%</b>`
-  : `🏦 Virtual Balance: <b>$${fmt(user.balance_usd||10000)}</b>
-💡 Add demo funds to track real position sizing`}
-📊 Open Trades: <b>${trades.length}</b>
-✅ Closed: <b>${closed.length}</b>
-💰 Paper P&L: <b>${fmtPnl(pnl)}</b>
-──────────────────────────`;
-    if (trades.length) {
-      msg += '\n\n<b>Open Positions:</b>';
-      for (const t of trades.slice(0,3)) {
-        msg += `\n• <b>${t.pair}</b> ${t.action} @ $${fmt(t.entry_price,4)}\n  ${tradeTimer(t)}\n  🎯 TP: $${fmt(t.take_profit,4)} | 🛡️ SL: $${fmt(t.stop_loss,4)}`;
-      }
+${returnEmoji} Total Return: <b>${parseFloat(totalReturn)>=0?'+':''}${totalReturn}%</b>
+✅ Win Rate: <b>${winRate}%</b>  |  📁 Realized: <b>${fmtPnl(realizedPnl)}</b>
+📈 Closed: <b>${closed.length}</b>  |  🔴 Open: <b>${openTrades.length}</b>
+══════════════════════════`;
+
+    if (posLines.length) {
+      msg += '\n\n🔴 <b>LIVE POSITIONS</b>\n──────────────────────────\n';
+      msg += posLines.join('\n──────────────────────────\n');
+      msg += '\n\n💡 Tap a trade ID above to close it manually.';
+    } else if (!strategies.length) {
+      msg += '\n\n💤 <b>No active paper strategy.</b>\nCreate one first so the bot knows which pair + rules to trade.';
     } else {
-      msg += '\n\n💤 No open paper trades.\nSend a signal or create a strategy!';
+      msg += '\n\n✅ Strategy ready: <b>' + strategies[0].name + '</b> (' + strategies[0].pair + ')\nTap <b>📈 BUY Now</b> or <b>📉 SELL Now</b> to open your first trade!';
     }
+
     const kb = {inline_keyboard:[]};
-    kb.inline_keyboard.push([
-      {text:'💰 Add Demo Funds',callback_data:'demo_add_funds'},
-      {text:'🔄 Reset Demo',callback_data:'demo_reset'}
-    ]);
-    if (trades.length) {
-      kb.inline_keyboard.push([{text:'❌ Close All Paper Trades',callback_data:'close_all_paper'}]);
+    if (strategies.length) {
+      kb.inline_keyboard.push([
+        {text:'📈 BUY Now',  callback_data:'demo_quick_buy'},
+        {text:'📉 SELL Now', callback_data:'demo_quick_sell'}
+      ]);
+    } else {
+      kb.inline_keyboard.push([{text:'🤖 Create Strategy First', callback_data:'menu_create'}]);
     }
-    kb.inline_keyboard.push([{text:'🤖 Create Strategy',callback_data:'menu_create'},{text:'🏠 Menu',callback_data:'menu_main'}]);
+    if (openTrades.length) {
+      kb.inline_keyboard.push([
+        {text:'🔄 Refresh P&L', callback_data:'menu_paper'},
+        {text:'❌ Close All',   callback_data:'close_all_paper'}
+      ]);
+    }
+    kb.inline_keyboard.push([
+      {text:'📉 View Chart',    callback_data:'demo_chart'},
+      {text:'📋 Trade History', callback_data:'demo_history'}
+    ]);
+    kb.inline_keyboard.push([
+      {text:'💰 Add Funds',  callback_data:'demo_add_funds'},
+      {text:'🔄 Reset Demo', callback_data:'demo_reset'}
+    ]);
+    kb.inline_keyboard.push([{text:'🏠 Main Menu', callback_data:'menu_main'}]);
     await sendTelegram(chat_id, msg, kb);
 
   } else if (data==='demo_add_funds') {
@@ -1077,18 +1129,6 @@ ${demoActive
         backToMenu());
     }
     return;
-
-  } else if (data==='test_paper_trade') {
-    const paperStrats = listStrategies(chat_id).filter(s=>s.mode==='paper'&&s.is_active);
-    if (!paperStrats.length) {
-      await sendTelegram(chat_id,
-        `⚠️ <b>No Active Paper Strategy</b>\n──────────────────────────\nYou need to create a paper trading strategy first!\n\nTap Create Strategy, set mode to Paper, and come back.`,
-        {inline_keyboard:[[{text:'🤖 Create Strategy',callback_data:'menu_create'},{text:'🏠 Menu',callback_data:'menu_main'}]]});
-      return;
-    }
-    const strat = paperStrats[0];
-    await sendTelegram(chat_id, `🔥 <b>Firing test BUY on "${strat.name}" (${strat.pair})...</b>`);
-    await processSignal(chat_id, {pair: strat.pair, action:'BUY', price:null});
 
   } else if (data==='demo_quick_buy'||data==='demo_quick_sell') {
     const action = data==='demo_quick_buy'?'BUY':'SELL';
@@ -1582,7 +1622,7 @@ const app = express();
 app.use(express.json());
 
 app.get('/', (req,res) => {
-  res.json({status:'TradeBot AutoLab v5.0 🤖', version:'7.0', uptime:`${Math.floor(process.uptime())}s`, time:new Date().toISOString()});
+  res.json({status:'TradeBot AutoLab v5.0 🤖', version:'8.0', uptime:`${Math.floor(process.uptime())}s`, time:new Date().toISOString()});
 });
 
 // Stripe webhook for payment confirmation
@@ -1675,7 +1715,7 @@ app.post('/signal', async (req,res) => {
 app.get('/health', (req,res) => {
   const users = getAllUsers();
   const trades = db.prepare('SELECT COUNT(*) as c FROM trades').get().c;
-  res.json({status:'ok', users:users.length, trades, version:'7.0', uptime:Math.floor(process.uptime())});
+  res.json({status:'ok', users:users.length, trades, version:'8.0', uptime:Math.floor(process.uptime())});
 });
 
 // ─── START ────────────────────────────────────────────────────────────────────
